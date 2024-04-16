@@ -60,6 +60,9 @@ else ifneq ($(filter shared_lib install-shared, $(MAKECMDGOALS)),)
 else ifneq ($(filter static_lib install-static, $(MAKECMDGOALS)),)
 	DEBUG_LEVEL=0
 	LIB_MODE=static
+else ifneq ($(filter xcframework, $(MAKECMDGOALS)),)
+	DEBUG_LEVEL=0
+	LIB_MODE=static
 else ifneq ($(filter jtest rocksdbjava%, $(MAKECMDGOALS)),)
 	OBJ_DIR=jl
 	LIB_MODE=shared
@@ -279,14 +282,6 @@ endif
 endif
 
 CXXFLAGS += $(ARCHFLAG)
-
-ifeq (,$(shell $(CXX) -fsyntax-only -march=armv8-a+crc+crypto -xc /dev/null 2>&1))
-ifneq ($(PLATFORM),OS_MACOSX)
-CXXFLAGS += -march=armv8-a+crc+crypto
-CFLAGS += -march=armv8-a+crc+crypto
-ARMCRC_SOURCE=1
-endif
-endif
 
 export JAVAC_ARGS
 CLEAN_FILES += make_config.mk rocksdb.pc
@@ -1273,8 +1268,14 @@ package:
 # 	Unit tests and tools
 # ---------------------------------------------------------------------------
 $(STATIC_LIBRARY): $(LIB_OBJECTS)
-	$(AM_V_AR)rm -f $@ $(SHARED1) $(SHARED2) $(SHARED3) $(SHARED4)
-	$(AM_V_at)$(AR) $(ARFLAGS) $@ $(LIB_OBJECTS)
+	$(AM_V_AR)rm -f iphonesimulator-$@ $(SHARED1) $(SHARED2) $(SHARED3) $(SHARED4)
+	$(AM_V_at)$(AR) $(ARFLAGS) iphonesimulator-$@ $(addprefix ./iphonesimulator/, $(LIB_OBJECTS))
+
+	$(AM_V_AR)rm -f iphonedevice-$@ $(SHARED1) $(SHARED2) $(SHARED3) $(SHARED4)
+	$(AM_V_at)$(AR) $(ARFLAGS) iphonedevice-$@ $(addprefix ./iphonedevice/, $(LIB_OBJECTS))
+
+	$(AM_V_AR)rm -f maccatalyst-$@ $(SHARED1) $(SHARED2) $(SHARED3) $(SHARED4)
+	$(AM_V_at)$(AR) $(ARFLAGS) maccatalyst-$@ $(addprefix maccatalyst/, $(LIB_OBJECTS))
 
 $(STATIC_TEST_LIBRARY): $(TEST_OBJECTS)
 	$(AM_V_AR)rm -f $@ $(SHARED_TEST_LIBRARY)
@@ -2499,25 +2500,32 @@ build_size:
 ifeq ($(PLATFORM), IOS)
 # For iOS, create universal object files to be used on both the simulator and
 # a device.
-XCODEROOT=$(shell xcode-select -print-path)
-PLATFORMSROOT=$(XCODEROOT)/Platforms
-SIMULATORROOT=$(PLATFORMSROOT)/iPhoneSimulator.platform/Developer
-DEVICEROOT=$(PLATFORMSROOT)/iPhoneOS.platform/Developer
-IOSVERSION=$(shell defaults read $(PLATFORMSROOT)/iPhoneOS.platform/version CFBundleShortVersionString)
+SIMULATORSDK =$(shell xcrun --sdk iphonesimulator --show-sdk-path)
+IPHONESDK =$(shell xcrun --sdk iphoneos --show-sdk-path)
+MACOSSDK =$(shell xcrun --sdk macosx --show-sdk-path)
 
 .cc.o:
-	mkdir -p ios-x86/$(dir $@)
-	$(CXX) $(CXXFLAGS) -isysroot $(SIMULATORROOT)/SDKs/iPhoneSimulator$(IOSVERSION).sdk -arch i686 -arch x86_64 -c $< -o ios-x86/$@
-	mkdir -p ios-arm/$(dir $@)
-	xcrun -sdk iphoneos $(CXX) $(CXXFLAGS) -isysroot $(DEVICEROOT)/SDKs/iPhoneOS$(IOSVERSION).sdk -arch armv6 -arch armv7 -arch armv7s -arch arm64 -c $< -o ios-arm/$@
-	lipo ios-x86/$@ ios-arm/$@ -create -output $@
+	mkdir -p iphonesimulator/$(dir $@)
+	xcrun -sdk iphonesimulator $(CXX) $(CXXFLAGS) -mios-simulator-version-min=15.0 -isysroot $(SIMULATORSDK) -arch x86_64 -arch arm64 -c $< -o iphonesimulator/$@
+	mkdir -p iphonedevice/$(dir $@)
+	xcrun -sdk iphoneos $(CXX) $(CXXFLAGS) -miphoneos-version-min=15.0 -isysroot $(IPHONESDK) -arch arm64 -c $< -o iphonedevice/$@
+	mkdir -p maccatalyst/$(dir $@)
+	xcrun -sdk macosx $(CXX) $(CXXFLAGS) -isysroot $(MACOSSDK) -arch x86_64 -arch arm64 -target x86_64-apple-ios15.0-macabi -c $< -o maccatalyst/$@
 
 .c.o:
-	mkdir -p ios-x86/$(dir $@)
-	$(CC) $(CFLAGS) -isysroot $(SIMULATORROOT)/SDKs/iPhoneSimulator$(IOSVERSION).sdk -arch i686 -arch x86_64 -c $< -o ios-x86/$@
-	mkdir -p ios-arm/$(dir $@)
-	xcrun -sdk iphoneos $(CC) $(CFLAGS) -isysroot $(DEVICEROOT)/SDKs/iPhoneOS$(IOSVERSION).sdk -arch armv6 -arch armv7 -arch armv7s -arch arm64 -c $< -o ios-arm/$@
-	lipo ios-x86/$@ ios-arm/$@ -create -output $@
+	mkdir -p iphonesimulator/$(dir $@)
+	xcrun -sdk iphonesimulator $(CC) $(CFLAGS) -mios-simulator-version-min=15.0 -isysroot $(SIMULATORSDK) -arch x86_64 -arch arm64 -c $< -o iphonesimulator/$@
+	mkdir -p iphonedevice/$(dir $@)
+	xcrun -sdk iphoneos $(CC) $(CFLAGS) -miphoneos-version-min=15.0 -isysroot $(IPHONESDK) -arch arm64 -c $< -o iphonedevice/$@
+	mkdir -p maccatalyst/$(dir $@)
+	xcrun -sdk macosx $(CC) $(CFLAGS) -isysroot $(MACOSSDK) -arch x86_64 -arch arm64 -target x86_64-apple-ios15.0-macabi -c $< -o maccatalyst/$@
+
+xcframework:
+	xcodebuild -create-xcframework \
+	-library iphonedevice-librocksdb.a -headers ./include \
+	-library iphonesimulator-librocksdb.a -headers ./include \
+	-library maccatalyst-librocksdb.a -headers ./include \
+	-output RocksDB.xcframework
 
 else
 ifeq ($(HAVE_POWER8),1)
