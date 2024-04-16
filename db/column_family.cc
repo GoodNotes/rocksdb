@@ -96,16 +96,16 @@ const Comparator* ColumnFamilyHandleImpl::GetComparator() const {
   return cfd()->user_comparator();
 }
 
-void GetIntTblPropCollectorFactory(
+void GetInternalTblPropCollFactory(
     const ImmutableCFOptions& ioptions,
-    IntTblPropCollectorFactories* int_tbl_prop_collector_factories) {
-  assert(int_tbl_prop_collector_factories);
+    InternalTblPropCollFactories* internal_tbl_prop_coll_factories) {
+  assert(internal_tbl_prop_coll_factories);
 
   auto& collector_factories = ioptions.table_properties_collector_factories;
   for (size_t i = 0; i < ioptions.table_properties_collector_factories.size();
        ++i) {
     assert(collector_factories[i]);
-    int_tbl_prop_collector_factories->emplace_back(
+    internal_tbl_prop_coll_factories->emplace_back(
         new UserKeyTablePropertiesCollectorFactory(collector_factories[i]));
   }
 }
@@ -411,6 +411,13 @@ ColumnFamilyOptions SanitizeOptions(const ImmutableDBOptions& db_options,
           "periodic_compaction_seconds does not support FIFO compaction. You"
           "may want to set option TTL instead.");
     }
+    if (result.last_level_temperature != Temperature::kUnknown) {
+      ROCKS_LOG_WARN(
+          db_options.info_log.get(),
+          "last_level_temperature is ignored with FIFO compaction. Consider "
+          "CompactionOptionsFIFO::file_temperature_age_thresholds.");
+      result.last_level_temperature = Temperature::kUnknown;
+    }
   }
 
   // For universal compaction, `ttl` and `periodic_compaction_seconds` mean the
@@ -470,13 +477,16 @@ void SuperVersion::Cleanup() {
   cfd->UnrefAndTryDelete();
 }
 
-void SuperVersion::Init(ColumnFamilyData* new_cfd, MemTable* new_mem,
-                        MemTableListVersion* new_imm, Version* new_current) {
+void SuperVersion::Init(
+    ColumnFamilyData* new_cfd, MemTable* new_mem, MemTableListVersion* new_imm,
+    Version* new_current,
+    std::shared_ptr<const SeqnoToTimeMapping> new_seqno_to_time_mapping) {
   cfd = new_cfd;
   mem = new_mem;
   imm = new_imm;
   current = new_current;
   full_history_ts_low = cfd->GetFullHistoryTsLow();
+  seqno_to_time_mapping = std::move(new_seqno_to_time_mapping);
   cfd->Ref();
   mem->Ref();
   imm->Ref();
@@ -572,7 +582,7 @@ ColumnFamilyData::ColumnFamilyData(
   Ref();
 
   // Convert user defined table properties collector factories to internal ones.
-  GetIntTblPropCollectorFactory(ioptions_, &int_tbl_prop_collector_factories_);
+  GetInternalTblPropCollFactory(ioptions_, &internal_tbl_prop_coll_factories_);
 
   // if _dummy_versions is nullptr, then this is a dummy column family.
   if (_dummy_versions != nullptr) {
@@ -893,6 +903,14 @@ uint64_t GetPendingCompactionBytesForCompactionSpeedup(
   uint64_t size_threshold = bottommost_files_size / kBottommostSizeDivisor;
   return std::min(size_threshold, slowdown_threshold);
 }
+
+uint64_t GetMarkedFileCountForCompactionSpeedup() {
+  // When just one file is marked, it is not clear that parallel compaction will
+  // help the compaction that the user nicely requested to happen sooner. When
+  // multiple files are marked, however, it is pretty clearly helpful, except
+  // for the rare case in which a single compaction grabs all the marked files.
+  return 2;
+}
 }  // anonymous namespace
 
 std::pair<WriteStallCondition, WriteStallCause>
@@ -1074,6 +1092,16 @@ WriteStallCondition ColumnFamilyData::RecalculateWriteStallConditions(
             "compaction "
             "bytes %" PRIu64,
             name_.c_str(), vstorage->estimated_compaction_needed_bytes());
+      } else if (uint64_t(vstorage->FilesMarkedForCompaction().size()) >=
+                 GetMarkedFileCountForCompactionSpeedup()) {
+        write_controller_token_ =
+            write_controller->GetCompactionPressureToken();
+        ROCKS_LOG_INFO(
+            ioptions_.logger,
+            "[%s] Increasing compaction threads because we have %" PRIu64
+            " files marked for compaction",
+            name_.c_str(),
+            uint64_t(vstorage->FilesMarkedForCompaction().size()));
       } else {
         write_controller_token_.reset();
       }
@@ -1161,7 +1189,7 @@ bool ColumnFamilyData::RangeOverlapWithCompaction(
 }
 
 Status ColumnFamilyData::RangesOverlapWithMemtables(
-    const autovector<Range>& ranges, SuperVersion* super_version,
+    const autovector<UserKeyRange>& ranges, SuperVersion* super_version,
     bool allow_data_in_errors, bool* overlap) {
   assert(overlap != nullptr);
   *overlap = false;
@@ -1171,11 +1199,12 @@ Status ColumnFamilyData::RangesOverlapWithMemtables(
   ReadOptions read_opts;
   read_opts.total_order_seek = true;
   MergeIteratorBuilder merge_iter_builder(&internal_comparator_, &arena);
-  merge_iter_builder.AddIterator(
-      super_version->mem->NewIterator(read_opts, &arena));
-  super_version->imm->AddIterators(read_opts, &merge_iter_builder,
+  merge_iter_builder.AddIterator(super_version->mem->NewIterator(
+      read_opts, /*seqno_to_time_mapping=*/nullptr, &arena));
+  super_version->imm->AddIterators(read_opts, /*seqno_to_time_mapping=*/nullptr,
+                                   &merge_iter_builder,
                                    false /* add_range_tombstone_iter */);
-  ScopedArenaIterator memtable_iter(merge_iter_builder.Finish());
+  ScopedArenaPtr<InternalIterator> memtable_iter(merge_iter_builder.Finish());
 
   auto read_seq = super_version->current->version_set()->LastSequence();
   ReadRangeDelAggregator range_del_agg(&internal_comparator_, read_seq);
@@ -1205,7 +1234,8 @@ Status ColumnFamilyData::RangesOverlapWithMemtables(
 
     if (status.ok()) {
       if (memtable_iter->Valid() &&
-          ucmp->Compare(seek_result.user_key, ranges[i].limit) <= 0) {
+          ucmp->CompareWithoutTimestamp(seek_result.user_key,
+                                        ranges[i].limit) <= 0) {
         *overlap = true;
       } else if (range_del_agg.IsRangeOverlapped(ranges[i].start,
                                                  ranges[i].limit)) {
@@ -1310,7 +1340,12 @@ void ColumnFamilyData::InstallSuperVersion(
     const MutableCFOptions& mutable_cf_options) {
   SuperVersion* new_superversion = sv_context->new_superversion.release();
   new_superversion->mutable_cf_options = mutable_cf_options;
-  new_superversion->Init(this, mem_, imm_.current(), current_);
+  new_superversion->Init(this, mem_, imm_.current(), current_,
+                         sv_context->new_seqno_to_time_mapping
+                             ? std::move(sv_context->new_seqno_to_time_mapping)
+                         : super_version_
+                             ? super_version_->ShareSeqnoToTimeMapping()
+                             : nullptr);
   SuperVersion* old_superversion = super_version_;
   super_version_ = new_superversion;
   if (old_superversion == nullptr || old_superversion->current != current() ||

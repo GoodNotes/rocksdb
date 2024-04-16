@@ -23,7 +23,6 @@
 #include "rocksdb/status.h"
 #include "rocksdb/table_properties.h"
 #include "rocksdb/types.h"
-#include "table/scoped_arena_iterator.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -50,7 +49,7 @@ TableBuilder* NewTableBuilder(const TableBuilderOptions& tboptions,
 //
 // @param column_family_name Name of the column family that is also identified
 //    by column_family_id, or empty string if unknown.
-extern Status BuildTable(
+Status BuildTable(
     const std::string& dbname, VersionSet* versions,
     const ImmutableDBOptions& db_options, const TableBuilderOptions& tboptions,
     const FileOptions& file_options, TableCache* table_cache,
@@ -64,7 +63,7 @@ extern Status BuildTable(
     bool paranoid_file_checks, InternalStats* internal_stats,
     IOStatus* io_status, const std::shared_ptr<IOTracer>& io_tracer,
     BlobFileCreationReason blob_creation_reason,
-    const SeqnoToTimeMapping& seqno_to_time_mapping,
+    UnownedPtr<const SeqnoToTimeMapping> seqno_to_time_mapping,
     EventLogger* event_logger = nullptr, int job_id = 0,
     TableProperties* table_properties = nullptr,
     Env::WriteLifeTimeHint write_hint = Env::WLTH_NOT_SET,

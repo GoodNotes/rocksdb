@@ -63,7 +63,6 @@
 #include "table/internal_iterator.h"
 #include "table/meta_blocks.h"
 #include "table/plain/plain_table_factory.h"
-#include "table/scoped_arena_iterator.h"
 #include "table/sst_file_writer_collectors.h"
 #include "table/unique_id_impl.h"
 #include "test_util/sync_point.h"
@@ -78,11 +77,6 @@
 #include "utilities/merge_operators.h"
 
 namespace ROCKSDB_NAMESPACE {
-
-extern const uint64_t kLegacyBlockBasedTableMagicNumber;
-extern const uint64_t kLegacyPlainTableMagicNumber;
-extern const uint64_t kBlockBasedTableMagicNumber;
-extern const uint64_t kPlainTableMagicNumber;
 
 namespace {
 
@@ -373,11 +367,11 @@ class TableConstructor : public Constructor {
     file_writer_.reset(new WritableFileWriter(
         std::move(sink), "" /* don't care */, FileOptions()));
     std::unique_ptr<TableBuilder> builder;
-    IntTblPropCollectorFactories int_tbl_prop_collector_factories;
+    InternalTblPropCollFactories internal_tbl_prop_coll_factories;
 
     if (largest_seqno_ != 0) {
       // Pretend that it's an external file written by SstFileWriter.
-      int_tbl_prop_collector_factories.emplace_back(
+      internal_tbl_prop_coll_factories.emplace_back(
           new SstFileWriterPropertiesCollectorFactory(2 /* version */,
                                                       0 /* global_seqno*/));
     }
@@ -388,7 +382,7 @@ class TableConstructor : public Constructor {
     builder.reset(ioptions.table_factory->NewTableBuilder(
         TableBuilderOptions(ioptions, moptions, read_options, write_options,
                             internal_comparator,
-                            &int_tbl_prop_collector_factories,
+                            &internal_tbl_prop_coll_factories,
                             options.compression, options.compression_opts,
                             kUnknownColumnFamily, column_family_name, level_),
         file_writer_.get()));
@@ -539,7 +533,9 @@ class MemTableConstructor : public Constructor {
   InternalIterator* NewIterator(
       const SliceTransform* /*prefix_extractor*/) const override {
     return new KeyConvertingIterator(
-        memtable_->NewIterator(ReadOptions(), &arena_), true);
+        memtable_->NewIterator(ReadOptions(), /*seqno_to_time_mapping=*/nullptr,
+                               &arena_),
+        true);
   }
 
   bool AnywayDeleteIterator() const override { return true; }
@@ -3213,7 +3209,7 @@ TEST_P(BlockBasedTableTest, BlockCacheLookupSeqScans) {
   c.Finish(options, ioptions, moptions, table_options, internal_comparator,
            &keys, &kvmap);
 
-  BlockBasedTable* bbt = reinterpret_cast<BlockBasedTable*>(c.GetTableReader());
+  BlockBasedTable* bbt = static_cast<BlockBasedTable*>(c.GetTableReader());
   BlockHandle block_handle;
 
   ReadOptions read_options;
@@ -3251,7 +3247,7 @@ TEST_P(BlockBasedTableTest, BlockCacheLookupSeqScans) {
       ASSERT_EQ(iter->value().ToString(), kv_iter->second);
 
       FilePrefetchBuffer* prefetch_buffer =
-          (reinterpret_cast<BlockBasedTableIterator*>(iter.get()))
+          (static_cast<BlockBasedTableIterator*>(iter.get()))
               ->prefetch_buffer();
       std::vector<std::pair<uint64_t, size_t>> buffer_info(1);
       prefetch_buffer->TEST_GetBufferOffsetandSize(buffer_info);
@@ -3289,7 +3285,7 @@ TEST_P(BlockBasedTableTest, BlockCacheLookupSeqScans) {
       ASSERT_EQ(iter->value().ToString(), kv_iter->second);
 
       FilePrefetchBuffer* prefetch_buffer =
-          (reinterpret_cast<BlockBasedTableIterator*>(iter.get()))
+          (static_cast<BlockBasedTableIterator*>(iter.get()))
               ->prefetch_buffer();
       std::vector<std::pair<uint64_t, size_t>> buffer_info(1);
       prefetch_buffer->TEST_GetBufferOffsetandSize(buffer_info);
@@ -3354,7 +3350,7 @@ TEST_P(BlockBasedTableTest, BlockCacheLookupAsyncScansSeek) {
   c.Finish(options, ioptions, moptions, table_options, internal_comparator,
            &keys, &kvmap);
 
-  BlockBasedTable* bbt = reinterpret_cast<BlockBasedTable*>(c.GetTableReader());
+  BlockBasedTable* bbt = static_cast<BlockBasedTable*>(c.GetTableReader());
   BlockHandle block_handle;
 
   ReadOptions read_options;
@@ -3397,7 +3393,7 @@ TEST_P(BlockBasedTableTest, BlockCacheLookupAsyncScansSeek) {
       ASSERT_EQ(iter->value().ToString(), kv_iter->second);
 
       FilePrefetchBuffer* prefetch_buffer =
-          (reinterpret_cast<BlockBasedTableIterator*>(iter.get()))
+          (static_cast<BlockBasedTableIterator*>(iter.get()))
               ->prefetch_buffer();
       std::vector<std::pair<uint64_t, size_t>> buffer_info(2);
       prefetch_buffer->TEST_GetBufferOffsetandSize(buffer_info);
@@ -3436,7 +3432,7 @@ TEST_P(BlockBasedTableTest, BlockCacheLookupAsyncScansSeek) {
       ASSERT_EQ(iter->value().ToString(), kv_iter->second);
 
       FilePrefetchBuffer* prefetch_buffer =
-          (reinterpret_cast<BlockBasedTableIterator*>(iter.get()))
+          (static_cast<BlockBasedTableIterator*>(iter.get()))
               ->prefetch_buffer();
       std::vector<std::pair<uint64_t, size_t>> buffer_info(2);
       prefetch_buffer->TEST_GetBufferOffsetandSize(buffer_info);
@@ -3487,7 +3483,7 @@ TEST_P(BlockBasedTableTest, BlockCacheLookupAsyncScansSeek) {
       ASSERT_EQ(iter->value().ToString(), kv_iter->second);
 
       FilePrefetchBuffer* prefetch_buffer =
-          (reinterpret_cast<BlockBasedTableIterator*>(iter.get()))
+          (static_cast<BlockBasedTableIterator*>(iter.get()))
               ->prefetch_buffer();
 
       {
@@ -4450,7 +4446,7 @@ TEST_P(BlockBasedTableTest, NoFileChecksum) {
   std::unique_ptr<InternalKeyComparator> comparator(
       new InternalKeyComparator(BytewiseComparator()));
   int level = 0;
-  IntTblPropCollectorFactories int_tbl_prop_collector_factories;
+  InternalTblPropCollFactories internal_tbl_prop_coll_factories;
   std::string column_family_name;
 
   FileChecksumTestHelper f(true);
@@ -4460,7 +4456,7 @@ TEST_P(BlockBasedTableTest, NoFileChecksum) {
   const WriteOptions write_options;
   builder.reset(ioptions.table_factory->NewTableBuilder(
       TableBuilderOptions(ioptions, moptions, read_options, write_options,
-                          *comparator, &int_tbl_prop_collector_factories,
+                          *comparator, &internal_tbl_prop_coll_factories,
                           options.compression, options.compression_opts,
                           kUnknownColumnFamily, column_family_name, level),
       f.GetFileWriter()));
@@ -4482,7 +4478,7 @@ TEST_P(BlockBasedTableTest, Crc32cFileChecksum) {
   std::unique_ptr<InternalKeyComparator> comparator(
       new InternalKeyComparator(BytewiseComparator()));
   int level = 0;
-  IntTblPropCollectorFactories int_tbl_prop_collector_factories;
+  InternalTblPropCollFactories internal_tbl_prop_coll_factories;
   std::string column_family_name;
 
   FileChecksumGenContext gen_context;
@@ -4498,7 +4494,7 @@ TEST_P(BlockBasedTableTest, Crc32cFileChecksum) {
   const WriteOptions write_options;
   builder.reset(ioptions.table_factory->NewTableBuilder(
       TableBuilderOptions(ioptions, moptions, read_options, write_options,
-                          *comparator, &int_tbl_prop_collector_factories,
+                          *comparator, &internal_tbl_prop_coll_factories,
                           options.compression, options.compression_opts,
                           kUnknownColumnFamily, column_family_name, level),
       f.GetFileWriter()));
@@ -4539,14 +4535,14 @@ TEST_F(PlainTableTest, BasicPlainTableProperties) {
   const ImmutableOptions ioptions(options);
   const MutableCFOptions moptions(options);
   InternalKeyComparator ikc(options.comparator);
-  IntTblPropCollectorFactories int_tbl_prop_collector_factories;
+  InternalTblPropCollFactories internal_tbl_prop_coll_factories;
   std::string column_family_name;
   int unknown_level = -1;
   const ReadOptions read_options;
   const WriteOptions write_options;
   std::unique_ptr<TableBuilder> builder(factory.NewTableBuilder(
       TableBuilderOptions(ioptions, moptions, read_options, write_options, ikc,
-                          &int_tbl_prop_collector_factories, kNoCompression,
+                          &internal_tbl_prop_coll_factories, kNoCompression,
                           CompressionOptions(), kUnknownColumnFamily,
                           column_family_name, unknown_level),
       file_writer.get()));
@@ -4592,7 +4588,7 @@ TEST_F(PlainTableTest, NoFileChecksum) {
   const ImmutableOptions ioptions(options);
   const MutableCFOptions moptions(options);
   InternalKeyComparator ikc(options.comparator);
-  IntTblPropCollectorFactories int_tbl_prop_collector_factories;
+  InternalTblPropCollFactories internal_tbl_prop_coll_factories;
   std::string column_family_name;
   int unknown_level = -1;
   FileChecksumTestHelper f(true);
@@ -4601,7 +4597,7 @@ TEST_F(PlainTableTest, NoFileChecksum) {
   const WriteOptions write_options;
   std::unique_ptr<TableBuilder> builder(factory.NewTableBuilder(
       TableBuilderOptions(ioptions, moptions, read_options, write_options, ikc,
-                          &int_tbl_prop_collector_factories, kNoCompression,
+                          &internal_tbl_prop_coll_factories, kNoCompression,
                           CompressionOptions(), kUnknownColumnFamily,
                           column_family_name, unknown_level),
       f.GetFileWriter()));
@@ -4626,7 +4622,7 @@ TEST_F(PlainTableTest, Crc32cFileChecksum) {
   const ImmutableOptions ioptions(options);
   const MutableCFOptions moptions(options);
   InternalKeyComparator ikc(options.comparator);
-  IntTblPropCollectorFactories int_tbl_prop_collector_factories;
+  InternalTblPropCollFactories internal_tbl_prop_coll_factories;
   std::string column_family_name;
   int unknown_level = -1;
 
@@ -4642,7 +4638,7 @@ TEST_F(PlainTableTest, Crc32cFileChecksum) {
   const WriteOptions write_options;
   std::unique_ptr<TableBuilder> builder(factory.NewTableBuilder(
       TableBuilderOptions(ioptions, moptions, read_options, write_options, ikc,
-                          &int_tbl_prop_collector_factories, kNoCompression,
+                          &internal_tbl_prop_coll_factories, kNoCompression,
                           CompressionOptions(), kUnknownColumnFamily,
                           column_family_name, unknown_level),
       f.GetFileWriter()));
@@ -4711,8 +4707,10 @@ static void DoCompressionTest(CompressionType comp) {
   Options options;
   test::PlainInternalKeyComparator ikc(options.comparator);
   options.compression = comp;
+  options.db_host_id = "";
   BlockBasedTableOptions table_options;
   table_options.block_size = 1024;
+  options.table_factory.reset(new BlockBasedTableFactory(table_options));
   const ImmutableOptions ioptions(options);
   const MutableCFOptions moptions(options);
   c.Finish(options, ioptions, moptions, table_options, ikc, &keys, &kvmap);
@@ -4896,12 +4894,13 @@ TEST_F(MemTableTest, Simple) {
 
   for (int i = 0; i < 2; ++i) {
     Arena arena;
-    ScopedArenaIterator arena_iter_guard;
+    ScopedArenaPtr<InternalIterator> arena_iter_guard;
     std::unique_ptr<InternalIterator> iter_guard;
     InternalIterator* iter;
     if (i == 0) {
-      iter = GetMemTable()->NewIterator(ReadOptions(), &arena);
-      arena_iter_guard.set(iter);
+      iter = GetMemTable()->NewIterator(
+          ReadOptions(), /*seqno_to_time_mapping=*/nullptr, &arena);
+      arena_iter_guard.reset(iter);
     } else {
       iter = GetMemTable()->NewRangeTombstoneIterator(
           ReadOptions(), kMaxSequenceNumber /* read_seq */,
@@ -5244,8 +5243,8 @@ TEST_P(BlockBasedTableTest, DISABLED_TableWithGlobalSeqno) {
   const ImmutableOptions ioptions(options);
   const MutableCFOptions moptions(options);
   InternalKeyComparator ikc(options.comparator);
-  IntTblPropCollectorFactories int_tbl_prop_collector_factories;
-  int_tbl_prop_collector_factories.emplace_back(
+  InternalTblPropCollFactories internal_tbl_prop_coll_factories;
+  internal_tbl_prop_coll_factories.emplace_back(
       new SstFileWriterPropertiesCollectorFactory(2 /* version */,
                                                   0 /* global_seqno*/));
   std::string column_family_name;
@@ -5253,7 +5252,7 @@ TEST_P(BlockBasedTableTest, DISABLED_TableWithGlobalSeqno) {
   const WriteOptions write_options;
   std::unique_ptr<TableBuilder> builder(options.table_factory->NewTableBuilder(
       TableBuilderOptions(ioptions, moptions, read_options, write_options, ikc,
-                          &int_tbl_prop_collector_factories, kNoCompression,
+                          &internal_tbl_prop_coll_factories, kNoCompression,
                           CompressionOptions(), kUnknownColumnFamily,
                           column_family_name, -1),
       file_writer.get()));
@@ -5429,13 +5428,13 @@ TEST_P(BlockBasedTableTest, BlockAlignTest) {
   const ImmutableOptions ioptions(options);
   const MutableCFOptions moptions(options);
   InternalKeyComparator ikc(options.comparator);
-  IntTblPropCollectorFactories int_tbl_prop_collector_factories;
+  InternalTblPropCollFactories internal_tbl_prop_coll_factories;
   std::string column_family_name;
   const ReadOptions read_options;
   const WriteOptions write_options;
   std::unique_ptr<TableBuilder> builder(options.table_factory->NewTableBuilder(
       TableBuilderOptions(ioptions, moptions, read_options, write_options, ikc,
-                          &int_tbl_prop_collector_factories, kNoCompression,
+                          &internal_tbl_prop_coll_factories, kNoCompression,
                           CompressionOptions(), kUnknownColumnFamily,
                           column_family_name, -1),
       file_writer.get()));
@@ -5521,13 +5520,13 @@ TEST_P(BlockBasedTableTest, PropertiesBlockRestartPointTest) {
   const ImmutableOptions ioptions(options);
   const MutableCFOptions moptions(options);
   InternalKeyComparator ikc(options.comparator);
-  IntTblPropCollectorFactories int_tbl_prop_collector_factories;
+  InternalTblPropCollFactories internal_tbl_prop_coll_factories;
   std::string column_family_name;
   const ReadOptions read_options;
   const WriteOptions write_options;
   std::unique_ptr<TableBuilder> builder(options.table_factory->NewTableBuilder(
       TableBuilderOptions(ioptions, moptions, read_options, write_options, ikc,
-                          &int_tbl_prop_collector_factories, kNoCompression,
+                          &internal_tbl_prop_coll_factories, kNoCompression,
                           CompressionOptions(), kUnknownColumnFamily,
                           column_family_name, -1),
       file_writer.get()));
@@ -6112,14 +6111,14 @@ TEST_F(ChargeCompressionDictionaryBuildingBufferTest, Basic) {
     ImmutableOptions ioptions(options);
     MutableCFOptions moptions(options);
     InternalKeyComparator ikc(options.comparator);
-    IntTblPropCollectorFactories int_tbl_prop_collector_factories;
+    InternalTblPropCollFactories internal_tbl_prop_coll_factories;
 
     const ReadOptions read_options;
     const WriteOptions write_options;
     std::unique_ptr<TableBuilder> builder(
         options.table_factory->NewTableBuilder(
             TableBuilderOptions(ioptions, moptions, read_options, write_options,
-                                ikc, &int_tbl_prop_collector_factories,
+                                ikc, &internal_tbl_prop_coll_factories,
                                 kSnappyCompression, options.compression_opts,
                                 kUnknownColumnFamily, "test_cf",
                                 -1 /* level */),
@@ -6191,13 +6190,13 @@ TEST_F(ChargeCompressionDictionaryBuildingBufferTest,
   ImmutableOptions ioptions(options);
   MutableCFOptions moptions(options);
   InternalKeyComparator ikc(options.comparator);
-  IntTblPropCollectorFactories int_tbl_prop_collector_factories;
+  InternalTblPropCollFactories internal_tbl_prop_coll_factories;
 
   const ReadOptions read_options;
   const WriteOptions write_options;
   std::unique_ptr<TableBuilder> builder(options.table_factory->NewTableBuilder(
       TableBuilderOptions(ioptions, moptions, read_options, write_options, ikc,
-                          &int_tbl_prop_collector_factories, kSnappyCompression,
+                          &internal_tbl_prop_coll_factories, kSnappyCompression,
                           options.compression_opts, kUnknownColumnFamily,
                           "test_cf", -1 /* level */),
       file_writer.get()));
@@ -6278,13 +6277,13 @@ TEST_F(ChargeCompressionDictionaryBuildingBufferTest, BasicWithCacheFull) {
   ImmutableOptions ioptions(options);
   MutableCFOptions moptions(options);
   InternalKeyComparator ikc(options.comparator);
-  IntTblPropCollectorFactories int_tbl_prop_collector_factories;
+  InternalTblPropCollFactories internal_tbl_prop_coll_factories;
 
   const ReadOptions read_options;
   const WriteOptions write_options;
   std::unique_ptr<TableBuilder> builder(options.table_factory->NewTableBuilder(
       TableBuilderOptions(ioptions, moptions, read_options, write_options, ikc,
-                          &int_tbl_prop_collector_factories, kSnappyCompression,
+                          &internal_tbl_prop_coll_factories, kSnappyCompression,
                           options.compression_opts, kUnknownColumnFamily,
                           "test_cf", -1 /* level */),
       file_writer.get()));

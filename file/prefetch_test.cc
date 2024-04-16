@@ -1550,7 +1550,7 @@ TEST_P(PrefetchTest, DBIterLevelReadAhead) {
     SyncPoint::GetInstance()->SetCallBack(
         "BlockPrefetcher::SetReadaheadState", [&](void* arg) {
           readahead_carry_over_count++;
-          size_t readahead_size = *reinterpret_cast<size_t*>(arg);
+          size_t readahead_size = *static_cast<size_t*>(arg);
           if (readahead_carry_over_count) {
             ASSERT_GT(readahead_size, 8 * 1024);
           }
@@ -1558,7 +1558,7 @@ TEST_P(PrefetchTest, DBIterLevelReadAhead) {
 
     SyncPoint::GetInstance()->SetCallBack(
         "FilePrefetchBuffer::TryReadFromCache", [&](void* arg) {
-          current_readahead_size = *reinterpret_cast<size_t*>(arg);
+          current_readahead_size = *static_cast<size_t*>(arg);
           ASSERT_GT(current_readahead_size, 0);
         });
 
@@ -1659,7 +1659,7 @@ TEST_P(PrefetchTest, DBIterLevelReadAheadWithAsyncIO) {
     SyncPoint::GetInstance()->SetCallBack(
         "BlockPrefetcher::SetReadaheadState", [&](void* arg) {
           readahead_carry_over_count++;
-          size_t readahead_size = *reinterpret_cast<size_t*>(arg);
+          size_t readahead_size = *static_cast<size_t*>(arg);
           if (readahead_carry_over_count) {
             ASSERT_GT(readahead_size, 8 * 1024);
           }
@@ -1667,7 +1667,7 @@ TEST_P(PrefetchTest, DBIterLevelReadAheadWithAsyncIO) {
 
     SyncPoint::GetInstance()->SetCallBack(
         "FilePrefetchBuffer::TryReadFromCache", [&](void* arg) {
-          current_readahead_size = *reinterpret_cast<size_t*>(arg);
+          current_readahead_size = *static_cast<size_t*>(arg);
           ASSERT_GT(current_readahead_size, 0);
         });
 
@@ -2057,7 +2057,7 @@ TEST_P(PrefetchTest1, NonSequentialReadsWithAdaptiveReadahead) {
       [&](void* /*arg*/) { set_readahead++; });
   SyncPoint::GetInstance()->SetCallBack(
       "FilePrefetchBuffer::TryReadFromCache",
-      [&](void* arg) { readahead_size = *reinterpret_cast<size_t*>(arg); });
+      [&](void* arg) { readahead_size = *static_cast<size_t*>(arg); });
 
   SyncPoint::GetInstance()->EnableProcessing();
 
@@ -2152,9 +2152,8 @@ TEST_P(PrefetchTest1, DecreaseReadAheadIfInCache) {
   SyncPoint::GetInstance()->SetCallBack("FilePrefetchBuffer::Prefetch:Start",
                                         [&](void*) { buff_prefetch_count++; });
   SyncPoint::GetInstance()->SetCallBack(
-      "FilePrefetchBuffer::TryReadFromCache", [&](void* arg) {
-        current_readahead_size = *reinterpret_cast<size_t*>(arg);
-      });
+      "FilePrefetchBuffer::TryReadFromCache",
+      [&](void* arg) { current_readahead_size = *static_cast<size_t*>(arg); });
 
   SyncPoint::GetInstance()->EnableProcessing();
   ReadOptions ro;
@@ -3108,8 +3107,8 @@ TEST_F(FilePrefetchBufferTest, SyncReadaheadStats) {
 
   // Simulate a block cache hit
   fpb.UpdateReadPattern(4096, 4096, false);
-  // Now read some data that'll prefetch additional data from 12288 to 16384
-  // (4096) +  8192 (readahead_size).
+  // Now read some data that'll prefetch additional data from 12288 to 24576.
+  // (8192) +  8192 (readahead_size).
   ASSERT_TRUE(
       fpb.TryReadFromCache(IOOptions(), r.get(), 8192, 8192, &result, &s));
   ASSERT_EQ(s, Status::OK());
@@ -3119,8 +3118,19 @@ TEST_F(FilePrefetchBufferTest, SyncReadaheadStats) {
   ASSERT_TRUE(
       fpb.TryReadFromCache(IOOptions(), r.get(), 12288, 4096, &result, &s));
   ASSERT_EQ(s, Status::OK());
-  ASSERT_EQ(stats->getTickerCount(PREFETCH_HITS), 1);
-  ASSERT_EQ(stats->getTickerCount(PREFETCH_BYTES_USEFUL), 8192);
+  ASSERT_EQ(stats->getAndResetTickerCount(PREFETCH_HITS), 1);
+  ASSERT_EQ(stats->getAndResetTickerCount(PREFETCH_BYTES_USEFUL), 8192);
+
+  // Now read some data with length doesn't align with aligment and it needs
+  // prefetching. Read from 16000 with length 10000 (i.e. requested end offset -
+  // 26000).
+  ASSERT_TRUE(
+      fpb.TryReadFromCache(IOOptions(), r.get(), 16000, 10000, &result, &s));
+  ASSERT_EQ(s, Status::OK());
+  ASSERT_EQ(stats->getAndResetTickerCount(PREFETCH_HITS), 0);
+  ASSERT_EQ(
+      stats->getAndResetTickerCount(PREFETCH_BYTES_USEFUL),
+      /* 24576(end offset of the buffer) - 16000(requested offset) =*/8576);
 }
 
 }  // namespace ROCKSDB_NAMESPACE

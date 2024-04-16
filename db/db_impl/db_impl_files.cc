@@ -52,7 +52,7 @@ Status DBImpl::DisableFileDeletions() {
   if (my_disable_delete_obsolete_files == 1) {
     ROCKS_LOG_INFO(immutable_db_options_.info_log, "File Deletions Disabled");
   } else {
-    ROCKS_LOG_WARN(immutable_db_options_.info_log,
+    ROCKS_LOG_INFO(immutable_db_options_.info_log,
                    "File Deletions Disabled, but already disabled. Counter: %d",
                    my_disable_delete_obsolete_files);
   }
@@ -67,17 +67,14 @@ Status DBImpl::DisableFileDeletionsWithLock() {
   return Status::OK();
 }
 
-Status DBImpl::EnableFileDeletions(bool force) {
+Status DBImpl::EnableFileDeletions() {
   // Job id == 0 means that this is not our background process, but rather
   // user thread
   JobContext job_context(0);
   int saved_counter;  // initialize on all paths
   {
     InstrumentedMutexLock l(&mutex_);
-    if (force) {
-      // if force, we need to enable file deletions right away
-      disable_delete_obsolete_files_ = 0;
-    } else if (disable_delete_obsolete_files_ > 0) {
+    if (disable_delete_obsolete_files_ > 0) {
       --disable_delete_obsolete_files_;
     }
     saved_counter = disable_delete_obsolete_files_;
@@ -92,7 +89,7 @@ Status DBImpl::EnableFileDeletions(bool force) {
       PurgeObsoleteFiles(job_context);
     }
   } else {
-    ROCKS_LOG_WARN(immutable_db_options_.info_log,
+    ROCKS_LOG_INFO(immutable_db_options_.info_log,
                    "File Deletions Enable, but not really enabled. Counter: %d",
                    saved_counter);
   }

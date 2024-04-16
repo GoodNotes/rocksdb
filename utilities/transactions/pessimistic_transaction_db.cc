@@ -204,8 +204,7 @@ Status TransactionDB::Open(const Options& options,
   DBOptions db_options(options);
   ColumnFamilyOptions cf_options(options);
   std::vector<ColumnFamilyDescriptor> column_families;
-  column_families.push_back(
-      ColumnFamilyDescriptor(kDefaultColumnFamilyName, cf_options));
+  column_families.emplace_back(kDefaultColumnFamilyName, cf_options);
   std::vector<ColumnFamilyHandle*> handles;
   Status s = TransactionDB::Open(db_options, txn_db_options, dbname,
                                  column_families, &handles, dbptr);
@@ -422,6 +421,27 @@ Status PessimisticTransactionDB::CreateColumnFamilies(
       lock_manager_->AddColumnFamily(handle);
       UpdateCFComparatorMap(handle);
     }
+  }
+
+  return s;
+}
+
+Status PessimisticTransactionDB::CreateColumnFamilyWithImport(
+    const ColumnFamilyOptions& options, const std::string& column_family_name,
+    const ImportColumnFamilyOptions& import_options,
+    const std::vector<const ExportImportFilesMetaData*>& metadatas,
+    ColumnFamilyHandle** handle) {
+  InstrumentedMutexLock l(&column_family_mutex_);
+  Status s = VerifyCFOptions(options);
+  if (!s.ok()) {
+    return s;
+  }
+
+  s = db_->CreateColumnFamilyWithImport(options, column_family_name,
+                                        import_options, metadatas, handle);
+  if (s.ok()) {
+    lock_manager_->AddColumnFamily(*handle);
+    UpdateCFComparatorMap(*handle);
   }
 
   return s;

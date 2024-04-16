@@ -25,11 +25,11 @@ Status CompactionOutputs::Finish(
   assert(meta != nullptr);
   Status s = intput_status;
   if (s.ok()) {
-    std::string seqno_to_time_mapping_str;
-    seqno_to_time_mapping.Encode(
-        seqno_to_time_mapping_str, meta->fd.smallest_seqno,
-        meta->fd.largest_seqno, meta->file_creation_time);
-    builder_->SetSeqnoTimeTableProperties(seqno_to_time_mapping_str,
+    SeqnoToTimeMapping relevant_mapping;
+    relevant_mapping.CopyFromSeqnoRange(
+        seqno_to_time_mapping, meta->fd.smallest_seqno, meta->fd.largest_seqno);
+    relevant_mapping.SetCapacity(kMaxSeqnoTimePairsPerSST);
+    builder_->SetSeqnoTimeTableProperties(relevant_mapping,
                                           meta->oldest_ancester_time);
     s = builder_->Finish();
 
@@ -320,7 +320,6 @@ bool CompactionOutputs::ShouldStopBefore(const CompactionIterator& c_iter) {
         being_grandparent_gap_ ? 2 : 3;
     if (compaction_->immutable_options()->compaction_style ==
             kCompactionStyleLevel &&
-        compaction_->immutable_options()->level_compaction_dynamic_file_size &&
         num_grandparent_boundaries_crossed >=
             num_skippable_boundaries_crossed &&
         grandparent_overlapped_bytes_ - previous_overlapped_bytes >
@@ -342,7 +341,6 @@ bool CompactionOutputs::ShouldStopBefore(const CompactionIterator& c_iter) {
     // improvement.
     if (compaction_->immutable_options()->compaction_style ==
             kCompactionStyleLevel &&
-        compaction_->immutable_options()->level_compaction_dynamic_file_size &&
         current_output_file_size_ >=
             ((compaction_->target_output_file_size() + 99) / 100) *
                 (50 + std::min(grandparent_boundary_switched_num_ * 5,

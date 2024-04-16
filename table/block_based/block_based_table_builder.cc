@@ -209,7 +209,7 @@ const uint64_t kLegacyBlockBasedTableMagicNumber = 0xdb4775248b80fb57ull;
 // But in the foreseeable future, we will add more and more properties that are
 // specific to block-based table.
 class BlockBasedTableBuilder::BlockBasedTablePropertiesCollector
-    : public IntTblPropCollector {
+    : public InternalTblPropColl {
  public:
   explicit BlockBasedTablePropertiesCollector(
       BlockBasedTableOptions::IndexType index_type, bool whole_key_filtering,
@@ -225,9 +225,9 @@ class BlockBasedTableBuilder::BlockBasedTablePropertiesCollector
     return Status::OK();
   }
 
-  virtual void BlockAdd(uint64_t /* block_uncomp_bytes */,
-                        uint64_t /* block_compressed_bytes_fast */,
-                        uint64_t /* block_compressed_bytes_slow */) override {
+  void BlockAdd(uint64_t /* block_uncomp_bytes */,
+                uint64_t /* block_compressed_bytes_fast */,
+                uint64_t /* block_compressed_bytes_slow */) override {
     // Intentionally left blank. No interest in collecting stats for
     // blocks.
   }
@@ -353,7 +353,7 @@ struct BlockBasedTableBuilder::Rep {
   std::string compressed_output;
   std::unique_ptr<FlushBlockPolicy> flush_block_policy;
 
-  std::vector<std::unique_ptr<IntTblPropCollector>> table_properties_collectors;
+  std::vector<std::unique_ptr<InternalTblPropColl>> table_properties_collectors;
 
   std::unique_ptr<ParallelCompressionRep> pc_rep;
   BlockCreateContext create_context;
@@ -480,8 +480,10 @@ struct BlockBasedTableBuilder::Rep {
         compression_ctxs(tbo.compression_opts.parallel_threads),
         verify_ctxs(tbo.compression_opts.parallel_threads),
         verify_dict(),
-        state((tbo.compression_opts.max_dict_bytes > 0) ? State::kBuffered
-                                                        : State::kUnbuffered),
+        state((tbo.compression_opts.max_dict_bytes > 0 &&
+               tbo.compression_type != kNoCompression)
+                  ? State::kBuffered
+                  : State::kUnbuffered),
         use_delta_encoding_for_index_values(table_opt.format_version >= 4 &&
                                             !table_opt.block_align),
         reason(tbo.reason),
@@ -575,12 +577,12 @@ struct BlockBasedTableBuilder::Rep {
           persist_user_defined_timestamps));
     }
 
-    assert(tbo.int_tbl_prop_collector_factories);
-    for (auto& factory : *tbo.int_tbl_prop_collector_factories) {
+    assert(tbo.internal_tbl_prop_coll_factories);
+    for (auto& factory : *tbo.internal_tbl_prop_coll_factories) {
       assert(factory);
 
-      std::unique_ptr<IntTblPropCollector> collector{
-          factory->CreateIntTblPropCollector(tbo.column_family_id,
+      std::unique_ptr<InternalTblPropColl> collector{
+          factory->CreateInternalTblPropColl(tbo.column_family_id,
                                              tbo.level_at_creation)};
       if (collector) {
         table_properties_collectors.emplace_back(std::move(collector));
@@ -707,7 +709,7 @@ struct BlockBasedTableBuilder::ParallelCompressionRep {
     template <typename T>
     void Fill(T&& rep) {
       slot_.push(std::forward<T>(rep));
-    };
+    }
     void Take(BlockRep*& rep) { slot_.pop(rep); }
 
    private:
@@ -1072,14 +1074,26 @@ void BlockBasedTableBuilder::Add(const Slice& key, const Slice& value) {
                                       r->ioptions.logger);
 
   } else if (value_type == kTypeRangeDeletion) {
-    // TODO(yuzhangyu): handle range deletion entries for UDT in memtable only.
-    r->range_del_block.Add(key, value);
+    Slice persisted_end = value;
+    // When timestamps should not be persisted, we physically strip away range
+    // tombstone end key's user timestamp before passing it along to block
+    // builder. Physically stripping away start key's user timestamp is
+    // handled at the block builder level in the same way as the other data
+    // blocks.
+    if (r->ts_sz > 0 && !r->persist_user_defined_timestamps) {
+      persisted_end = StripTimestampFromUserKey(value, r->ts_sz);
+    }
+    r->range_del_block.Add(key, persisted_end);
     // TODO offset passed in is not accurate for parallel compression case
     NotifyCollectTableCollectorsOnAdd(key, value, r->get_offset(),
                                       r->table_properties_collectors,
                                       r->ioptions.logger);
   } else {
     assert(false);
+    r->SetStatus(Status::InvalidArgument(
+        "BlockBasedBuilder::Add() received a key with invalid value type " +
+        std::to_string(static_cast<unsigned int>(value_type))));
+    return;
   }
 
   r->props.num_entries++;
@@ -2105,9 +2119,9 @@ const char* BlockBasedTableBuilder::GetFileChecksumFuncName() const {
   }
 }
 void BlockBasedTableBuilder::SetSeqnoTimeTableProperties(
-    const std::string& encoded_seqno_to_time_mapping,
-    uint64_t oldest_ancestor_time) {
-  rep_->props.seqno_to_time_mapping = encoded_seqno_to_time_mapping;
+    const SeqnoToTimeMapping& relevant_mapping, uint64_t oldest_ancestor_time) {
+  assert(rep_->props.seqno_to_time_mapping.empty());
+  relevant_mapping.EncodeTo(rep_->props.seqno_to_time_mapping);
   rep_->props.creation_time = oldest_ancestor_time;
 }
 

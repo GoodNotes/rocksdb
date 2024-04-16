@@ -25,7 +25,7 @@ namespace ROCKSDB_NAMESPACE {
 // and the value type is embedded as the low 8 bits in the sequence
 // number in internal keys, we need to use the highest-numbered
 // ValueType, not the lowest).
-const ValueType kValueTypeForSeek = kTypeWideColumnEntity;
+const ValueType kValueTypeForSeek = kTypeValuePreferredSeqno;
 const ValueType kValueTypeForSeekForPrev = kTypeDeletion;
 const std::string kDisableUserTimestamp;
 
@@ -64,6 +64,13 @@ void AppendInternalKeyWithDifferentTimestamp(std::string* result,
   result->append(key.user_key.data(), key.user_key.size() - ts.size());
   result->append(ts.data(), ts.size());
   PutFixed64(result, PackSequenceAndType(key.sequence, key.type));
+}
+
+void AppendUserKeyWithDifferentTimestamp(std::string* result, const Slice& key,
+                                         const Slice& ts) {
+  assert(key.size() >= ts.size());
+  result->append(key.data(), key.size() - ts.size());
+  result->append(ts.data(), ts.size());
 }
 
 void AppendInternalKeyFooter(std::string* result, SequenceNumber s,
@@ -110,10 +117,22 @@ void AppendUserKeyWithMaxTimestamp(std::string* result, const Slice& key,
 void PadInternalKeyWithMinTimestamp(std::string* result, const Slice& key,
                                     size_t ts_sz) {
   assert(ts_sz > 0);
+  assert(key.size() >= kNumInternalBytes);
   size_t user_key_size = key.size() - kNumInternalBytes;
   result->reserve(key.size() + ts_sz);
   result->append(key.data(), user_key_size);
   result->append(ts_sz, static_cast<unsigned char>(0));
+  result->append(key.data() + user_key_size, kNumInternalBytes);
+}
+
+void PadInternalKeyWithMaxTimestamp(std::string* result, const Slice& key,
+                                    size_t ts_sz) {
+  assert(ts_sz > 0);
+  assert(key.size() >= kNumInternalBytes);
+  size_t user_key_size = key.size() - kNumInternalBytes;
+  result->reserve(key.size() + ts_sz);
+  result->append(key.data(), user_key_size);
+  result->append(std::string(ts_sz, '\xff'));
   result->append(key.data() + user_key_size, kNumInternalBytes);
 }
 

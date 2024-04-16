@@ -591,6 +591,7 @@ class FilePickerMultiGet {
     FdWithKeyRange* f = nullptr;
     bool file_hit = false;
     int cmp_largest = -1;
+    int cmp_smallest = -1;
     if (curr_file_index >= curr_file_level_->num_files) {
       // In the unlikely case the next key is a duplicate of the current key,
       // and the current key is the last in the level and the internal key
@@ -642,7 +643,7 @@ class FilePickerMultiGet {
         // Check if key is within a file's range. If search left bound and
         // right bound point to the same find, we are sure key falls in
         // range.
-        int cmp_smallest = user_comparator_->CompareWithoutTimestamp(
+        cmp_smallest = user_comparator_->CompareWithoutTimestamp(
             user_key, false, ExtractUserKey(f->smallest_key), true);
 
         assert(curr_level_ == 0 ||
@@ -688,6 +689,12 @@ class FilePickerMultiGet {
                user_comparator_->CompareWithoutTimestamp(
                    batch_iter_->ukey_without_ts, false,
                    upper_key_->ukey_without_ts, false) == 0) {
+          if (curr_level_ > 0) {
+            struct FilePickerContext& ctx = fp_ctx_array_[upper_key_.index()];
+            file_indexer_->GetNextLevelIndex(
+                curr_level_, ctx.curr_index_in_curr_level, cmp_smallest,
+                cmp_largest, &ctx.search_left_bound, &ctx.search_right_bound);
+          }
           ++upper_key_;
         }
         break;
@@ -1710,13 +1717,13 @@ Status Version::GetPropertiesOfAllTables(const ReadOptions& read_options,
 }
 
 Status Version::GetPropertiesOfTablesInRange(
-    const ReadOptions& read_options, const Range* range, std::size_t n,
+    const ReadOptions& read_options, const autovector<UserKeyRange>& ranges,
     TablePropertiesCollection* props) const {
   for (int level = 0; level < storage_info_.num_non_empty_levels(); level++) {
-    for (decltype(n) i = 0; i < n; i++) {
+    for (const auto& range : ranges) {
       // Convert user_key into a corresponding internal key.
-      InternalKey k1(range[i].start, kMaxSequenceNumber, kValueTypeForSeek);
-      InternalKey k2(range[i].limit, kMaxSequenceNumber, kValueTypeForSeek);
+      InternalKey k1(range.start, kMaxSequenceNumber, kValueTypeForSeek);
+      InternalKey k2(range.limit, kMaxSequenceNumber, kValueTypeForSeek);
       std::vector<FileMetaData*> files;
       storage_info_.GetOverlappingInputs(level, &k1, &k2, &files, -1, nullptr,
                                          false);
@@ -2097,7 +2104,7 @@ Status Version::OverlapWithLevelIterator(const ReadOptions& read_options,
           BeforeFile(ucmp, &largest_user_key, file)) {
         continue;
       }
-      ScopedArenaIterator iter(cfd_->table_cache()->NewIterator(
+      ScopedArenaPtr<InternalIterator> iter(cfd_->table_cache()->NewIterator(
           read_options, file_options, cfd_->internal_comparator(),
           *file->file_metadata, &range_del_agg,
           mutable_cf_options_.prefix_extractor, nullptr,
@@ -2116,7 +2123,7 @@ Status Version::OverlapWithLevelIterator(const ReadOptions& read_options,
     }
   } else if (storage_info_.LevelFilesBrief(level).num_files > 0) {
     auto mem = arena.AllocateAligned(sizeof(LevelIterator));
-    ScopedArenaIterator iter(new (mem) LevelIterator(
+    ScopedArenaPtr<InternalIterator> iter(new (mem) LevelIterator(
         cfd_->table_cache(), read_options, file_options,
         cfd_->internal_comparator(), &storage_info_.LevelFilesBrief(level),
         mutable_cf_options_.prefix_extractor, should_sample_file_read(),
@@ -3091,7 +3098,7 @@ void Version::PrepareAppend(const MutableCFOptions& mutable_cf_options,
                             bool update_stats) {
   TEST_SYNC_POINT_CALLBACK(
       "Version::PrepareAppend:forced_check",
-      reinterpret_cast<void*>(&storage_info_.force_consistency_checks_));
+      static_cast<void*>(&storage_info_.force_consistency_checks_));
 
   if (update_stats) {
     UpdateAccumulatedStats(read_options);
@@ -4546,8 +4553,10 @@ const char* VersionStorageInfo::LevelSummary(
     // overwrite the last space
     --len;
   }
-  len += snprintf(scratch->buffer + len, sizeof(scratch->buffer) - len,
-                  "] max score %.2f", compaction_score_[0]);
+  len +=
+      snprintf(scratch->buffer + len, sizeof(scratch->buffer) - len,
+               "] max score %.2f, estimated pending compaction bytes %" PRIu64,
+               compaction_score_[0], estimated_compaction_needed_bytes_);
 
   if (!files_marked_for_compaction_.empty()) {
     snprintf(scratch->buffer + len, sizeof(scratch->buffer) - len,
