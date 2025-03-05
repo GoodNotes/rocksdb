@@ -12,7 +12,8 @@
 #include "logging/auto_roll_logger.h"
 #include "logging/logging.h"
 #include "monitoring/perf_context_imp.h"
-#include "rocksdb/configurable.h"
+#include "rocksdb/convenience.h"
+#include "rocksdb/utilities/options_util.h"
 #include "util/cast_util.h"
 #include "util/write_batch_util.h"
 
@@ -33,8 +34,8 @@ DBImplSecondary::~DBImplSecondary() = default;
 Status DBImplSecondary::Recover(
     const std::vector<ColumnFamilyDescriptor>& column_families,
     bool /*readonly*/, bool /*error_if_wal_file_exists*/,
-    bool /*error_if_data_exists_in_wals*/, uint64_t*,
-    RecoveryContext* /*recovery_ctx*/) {
+    bool /*error_if_data_exists_in_wals*/, bool /*is_retry*/, uint64_t*,
+    RecoveryContext* /*recovery_ctx*/, bool* /*can_retry*/) {
   mutex_.AssertHeld();
 
   JobContext job_context(0);
@@ -54,9 +55,9 @@ Status DBImplSecondary::Recover(
   // Initial max_total_in_memory_state_ before recovery logs.
   max_total_in_memory_state_ = 0;
   for (auto cfd : *versions_->GetColumnFamilySet()) {
-    auto* mutable_cf_options = cfd->GetLatestMutableCFOptions();
-    max_total_in_memory_state_ += mutable_cf_options->write_buffer_size *
-                                  mutable_cf_options->max_write_buffer_number;
+    const auto& mutable_cf_options = cfd->GetLatestMutableCFOptions();
+    max_total_in_memory_state_ += mutable_cf_options.write_buffer_size *
+                                  mutable_cf_options.max_write_buffer_number;
   }
   if (s.ok()) {
     default_cf_handle_ = new ColumnFamilyHandleImpl(
@@ -232,7 +233,8 @@ Status DBImplSecondary::RecoverLogFiles(
           reader->GetRecordedTimestampSize();
       status = HandleWriteBatchTimestampSizeDifference(
           &batch, running_ts_sz, record_ts_sz,
-          TimestampSizeConsistencyMode::kVerifyConsistency);
+          TimestampSizeConsistencyMode::kVerifyConsistency, seq_per_batch_,
+          batch_per_txn_);
       if (!status.ok()) {
         break;
       }
@@ -246,9 +248,7 @@ Status DBImplSecondary::RecoverLogFiles(
           if (cfd == nullptr) {
             continue;
           }
-          if (cfds_changed->count(cfd) == 0) {
-            cfds_changed->insert(cfd);
-          }
+          cfds_changed->insert(cfd);
           const std::vector<FileMetaData*>& l0_files =
               cfd->current()->storage_info()->LevelFiles(0);
           SequenceNumber seq =
@@ -270,10 +270,8 @@ Status DBImplSecondary::RecoverLogFiles(
           if (!cfd->mem()->IsEmpty() &&
               (curr_log_num == std::numeric_limits<uint64_t>::max() ||
                curr_log_num != log_number)) {
-            const MutableCFOptions mutable_cf_options =
-                *cfd->GetLatestMutableCFOptions();
-            MemTable* new_mem =
-                cfd->ConstructNewMemtable(mutable_cf_options, seq_of_batch);
+            MemTable* new_mem = cfd->ConstructNewMemtable(
+                cfd->GetLatestMutableCFOptions(), seq_of_batch);
             cfd->mem()->SetNextLogNumber(log_number);
             cfd->mem()->ConstructFragmentedRangeTombstones();
             cfd->imm()->Add(cfd->mem(), &job_context->memtables_to_free);
@@ -344,7 +342,8 @@ Status DBImplSecondary::GetImpl(const ReadOptions& read_options,
                                 const Slice& key,
                                 GetImplOptions& get_impl_options) {
   assert(get_impl_options.value != nullptr ||
-         get_impl_options.columns != nullptr);
+         get_impl_options.columns != nullptr ||
+         get_impl_options.merge_operands != nullptr);
   assert(get_impl_options.column_family);
 
   Status s;
@@ -399,37 +398,64 @@ Status DBImplSecondary::GetImpl(const ReadOptions& read_options,
     }
   }
   MergeContext merge_context;
+  // TODO - Large Result Optimization for Secondary DB
+  // (https://github.com/facebook/rocksdb/pull/10458)
+
   SequenceNumber max_covering_tombstone_seq = 0;
   LookupKey lkey(key, snapshot, read_options.timestamp);
   PERF_TIMER_STOP(get_snapshot_time);
   bool done = false;
 
   // Look up starts here
-  if (super_version->mem->Get(
-          lkey,
-          get_impl_options.value ? get_impl_options.value->GetSelf() : nullptr,
-          get_impl_options.columns, ts, &s, &merge_context,
-          &max_covering_tombstone_seq, read_options,
-          false /* immutable_memtable */, &read_cb)) {
-    done = true;
-    if (get_impl_options.value) {
-      get_impl_options.value->PinSelf();
+  if (get_impl_options.get_value) {
+    if (super_version->mem->Get(
+            lkey,
+            get_impl_options.value ? get_impl_options.value->GetSelf()
+                                   : nullptr,
+            get_impl_options.columns, ts, &s, &merge_context,
+            &max_covering_tombstone_seq, read_options,
+            false /* immutable_memtable */, &read_cb,
+            /*is_blob_index=*/nullptr, /*do_merge=*/true)) {
+      done = true;
+      if (get_impl_options.value) {
+        get_impl_options.value->PinSelf();
+      }
+      RecordTick(stats_, MEMTABLE_HIT);
+    } else if ((s.ok() || s.IsMergeInProgress()) &&
+               super_version->imm->Get(
+                   lkey,
+                   get_impl_options.value ? get_impl_options.value->GetSelf()
+                                          : nullptr,
+                   get_impl_options.columns, ts, &s, &merge_context,
+                   &max_covering_tombstone_seq, read_options, &read_cb)) {
+      done = true;
+      if (get_impl_options.value) {
+        get_impl_options.value->PinSelf();
+      }
+      RecordTick(stats_, MEMTABLE_HIT);
     }
-    RecordTick(stats_, MEMTABLE_HIT);
-  } else if ((s.ok() || s.IsMergeInProgress()) &&
-             super_version->imm->Get(
-                 lkey,
-                 get_impl_options.value ? get_impl_options.value->GetSelf()
-                                        : nullptr,
-                 get_impl_options.columns, ts, &s, &merge_context,
-                 &max_covering_tombstone_seq, read_options, &read_cb)) {
-    done = true;
-    if (get_impl_options.value) {
-      get_impl_options.value->PinSelf();
+  } else {
+    // GetMergeOperands
+    if (super_version->mem->Get(
+            lkey,
+            get_impl_options.value ? get_impl_options.value->GetSelf()
+                                   : nullptr,
+            get_impl_options.columns, ts, &s, &merge_context,
+            &max_covering_tombstone_seq, read_options,
+            false /* immutable_memtable */, &read_cb,
+            /*is_blob_index=*/nullptr, /*do_merge=*/false)) {
+      done = true;
+      RecordTick(stats_, MEMTABLE_HIT);
+    } else if ((s.ok() || s.IsMergeInProgress()) &&
+               super_version->imm->GetMergeOperands(lkey, &s, &merge_context,
+                                                    &max_covering_tombstone_seq,
+                                                    read_options)) {
+      done = true;
+      RecordTick(stats_, MEMTABLE_HIT);
     }
-    RecordTick(stats_, MEMTABLE_HIT);
   }
-  if (!done && !s.ok() && !s.IsMergeInProgress()) {
+  if (!s.ok() && !s.IsMergeInProgress() && !s.IsNotFound()) {
+    assert(done);
     ReturnAndCleanupSuperVersion(cfd, super_version);
     return s;
   }
@@ -453,6 +479,14 @@ Status DBImplSecondary::GetImpl(const ReadOptions& read_options,
       size = get_impl_options.value->size();
     } else if (get_impl_options.columns) {
       size = get_impl_options.columns->serialized_size();
+    } else if (get_impl_options.merge_operands) {
+      *get_impl_options.number_of_operands =
+          static_cast<int>(merge_context.GetNumOperands());
+      for (const Slice& sl : merge_context.GetOperands()) {
+        size += sl.size();
+        get_impl_options.merge_operands->PinSelf(sl);
+        get_impl_options.merge_operands++;
+      }
     }
     RecordTick(stats_, BYTES_READ, size);
     RecordTimeToHistogram(stats_, BYTES_PER_READ, size);
@@ -533,7 +567,7 @@ ArenaWrappedDBIter* DBImplSecondary::NewIteratorImpl(
   snapshot = versions_->LastSequence();
   assert(snapshot != kMaxSequenceNumber);
   auto db_iter = NewArenaWrappedDbIterator(
-      env_, read_options, *cfh->cfd()->ioptions(),
+      env_, read_options, cfh->cfd()->ioptions(),
       super_version->mutable_cf_options, super_version->current, snapshot,
       super_version->mutable_cf_options.max_sequential_skip_in_iterations,
       super_version->version_number, read_callback, cfh, expose_blob_index,
@@ -680,7 +714,8 @@ Status DBImplSecondary::TryCatchUpWithPrimary() {
     InstrumentedMutexLock lock_guard(&mutex_);
     s = static_cast_with_check<ReactiveVersionSet>(versions_.get())
             ->ReadAndApply(&mutex_, &manifest_reader_,
-                           manifest_reader_status_.get(), &cfds_changed);
+                           manifest_reader_status_.get(), &cfds_changed,
+                           /*files_to_delete=*/nullptr);
 
     ROCKS_LOG_INFO(immutable_db_options_.info_log, "Last sequence is %" PRIu64,
                    static_cast<uint64_t>(versions_->LastSequence()));
@@ -736,7 +771,8 @@ Status DBImplSecondary::TryCatchUpWithPrimary() {
 }
 
 Status DB::OpenAsSecondary(const Options& options, const std::string& dbname,
-                           const std::string& secondary_path, DB** dbptr) {
+                           const std::string& secondary_path,
+                           std::unique_ptr<DB>* dbptr) {
   *dbptr = nullptr;
 
   DBOptions db_options(options);
@@ -758,7 +794,7 @@ Status DB::OpenAsSecondary(
     const DBOptions& db_options, const std::string& dbname,
     const std::string& secondary_path,
     const std::vector<ColumnFamilyDescriptor>& column_families,
-    std::vector<ColumnFamilyHandle*>* handles, DB** dbptr) {
+    std::vector<ColumnFamilyHandle*>* handles, std::unique_ptr<DB>* dbptr) {
   *dbptr = nullptr;
 
   DBOptions tmp_opts(db_options);
@@ -825,7 +861,7 @@ Status DB::OpenAsSecondary(
   impl->mutex_.Unlock();
   sv_context.Clean();
   if (s.ok()) {
-    *dbptr = impl;
+    dbptr->reset(impl);
     for (auto h : *handles) {
       impl->NewThreadStatusCfInfo(
           static_cast_with_check<ColumnFamilyHandleImpl>(h)->cfd());
@@ -863,21 +899,24 @@ Status DBImplSecondary::CompactWithoutInstallation(
   ColumnFamilyMetaData cf_meta;
   version->GetColumnFamilyMetaData(&cf_meta);
 
-  const MutableCFOptions* mutable_cf_options = cfd->GetLatestMutableCFOptions();
-  ColumnFamilyOptions cf_options = cfd->GetLatestCFOptions();
   VersionStorageInfo* vstorage = version->storage_info();
 
   // Use comp_options to reuse some CompactFiles functions
   CompactionOptions comp_options;
   comp_options.compression = kDisableCompressionOption;
   comp_options.output_file_size_limit = MaxFileSizeForLevel(
-      *mutable_cf_options, input.output_level, cf_options.compaction_style,
-      vstorage->base_level(), cf_options.level_compaction_dynamic_level_bytes);
+      cfd->GetLatestMutableCFOptions(), input.output_level,
+      cfd->ioptions().compaction_style, vstorage->base_level(),
+      cfd->ioptions().level_compaction_dynamic_level_bytes);
 
   std::vector<CompactionInputFiles> input_files;
   Status s = cfd->compaction_picker()->GetCompactionInputsFromFileNumbers(
       &input_files, &input_set, vstorage, comp_options);
   if (!s.ok()) {
+    ROCKS_LOG_ERROR(
+        immutable_db_options_.info_log,
+        "GetCompactionInputsFromFileNumbers() failed - %s.\n DebugString: %s",
+        s.ToString().c_str(), version->DebugString().c_str());
     return s;
   }
 
@@ -885,7 +924,7 @@ Status DBImplSecondary::CompactWithoutInstallation(
   assert(cfd->compaction_picker());
   c.reset(cfd->compaction_picker()->CompactFiles(
       comp_options, input_files, input.output_level, vstorage,
-      *mutable_cf_options, mutable_db_options_, 0));
+      cfd->GetLatestMutableCFOptions(), mutable_db_options_, 0));
   assert(c != nullptr);
 
   c->FinalizeInputInfo(version);
@@ -916,6 +955,8 @@ Status DBImplSecondary::CompactWithoutInstallation(
       options.canceled ? *options.canceled : kManualCompactionCanceledFalse_,
       input.db_id, db_session_id_, secondary_path_, input, result);
 
+  compaction_job.Prepare();
+
   mutex_.Unlock();
   s = compaction_job.Run();
   mutex_.Lock();
@@ -937,69 +978,105 @@ Status DB::OpenAndCompact(
     const std::string& output_directory, const std::string& input,
     std::string* output,
     const CompactionServiceOptionsOverride& override_options) {
+  // Check for cancellation
   if (options.canceled && options.canceled->load(std::memory_order_acquire)) {
     return Status::Incomplete(Status::SubCode::kManualCompactionPaused);
   }
+
+  // 1. Deserialize Compaction Input
   CompactionServiceInput compaction_input;
   Status s = CompactionServiceInput::Read(input, &compaction_input);
   if (!s.ok()) {
     return s;
   }
 
-  compaction_input.db_options.max_open_files = -1;
-  compaction_input.db_options.compaction_service = nullptr;
-  if (compaction_input.db_options.statistics) {
-    compaction_input.db_options.statistics.reset();
-  }
-  compaction_input.db_options.env = override_options.env;
-  compaction_input.db_options.file_checksum_gen_factory =
-      override_options.file_checksum_gen_factory;
-  compaction_input.db_options.statistics = override_options.statistics;
-  compaction_input.column_family.options.comparator =
-      override_options.comparator;
-  compaction_input.column_family.options.merge_operator =
-      override_options.merge_operator;
-  compaction_input.column_family.options.compaction_filter =
-      override_options.compaction_filter;
-  compaction_input.column_family.options.compaction_filter_factory =
-      override_options.compaction_filter_factory;
-  compaction_input.column_family.options.prefix_extractor =
-      override_options.prefix_extractor;
-  compaction_input.column_family.options.table_factory =
-      override_options.table_factory;
-  compaction_input.column_family.options.sst_partitioner_factory =
-      override_options.sst_partitioner_factory;
-  compaction_input.column_family.options.table_properties_collector_factories =
-      override_options.table_properties_collector_factories;
-  compaction_input.db_options.listeners = override_options.listeners;
+  // 2. Load the options
+  DBOptions db_options;
+  ConfigOptions config_options;
+  config_options.env = override_options.env;
+  std::vector<ColumnFamilyDescriptor> all_column_families;
 
-  std::vector<ColumnFamilyDescriptor> column_families;
-  column_families.push_back(compaction_input.column_family);
-  // TODO: we have to open default CF, because of an implementation limitation,
-  // currently we just use the same CF option from input, which is not collect
-  // and open may fail.
-  if (compaction_input.column_family.name != kDefaultColumnFamilyName) {
-    column_families.emplace_back(kDefaultColumnFamilyName,
-                                 compaction_input.column_family.options);
-  }
+  TEST_SYNC_POINT_CALLBACK(
+      "DBImplSecondary::OpenAndCompact::BeforeLoadingOptions:0",
+      &compaction_input.options_file_number);
+  TEST_SYNC_POINT("DBImplSecondary::OpenAndCompact::BeforeLoadingOptions:1");
+  std::string options_file_name =
+      OptionsFileName(name, compaction_input.options_file_number);
 
-  DB* db;
-  std::vector<ColumnFamilyHandle*> handles;
-
-  s = DB::OpenAsSecondary(compaction_input.db_options, name, output_directory,
-                          column_families, &handles, &db);
+  s = LoadOptionsFromFile(config_options, options_file_name, &db_options,
+                          &all_column_families);
   if (!s.ok()) {
     return s;
   }
 
+  // 3. Override pointer configurations in DBOptions with
+  // CompactionServiceOptionsOverride
+  db_options.env = override_options.env;
+  db_options.file_checksum_gen_factory =
+      override_options.file_checksum_gen_factory;
+  db_options.statistics = override_options.statistics;
+  db_options.listeners = override_options.listeners;
+  db_options.compaction_service = nullptr;
+  // We will close the DB after the compaction anyway.
+  // Open as many files as needed for the compaction.
+  db_options.max_open_files = -1;
+
+  // 4. Filter CFs that are needed for OpenAndCompact()
+  // We do not need to open all column families for the remote compaction.
+  // Only open default CF + target CF. If target CF == default CF, we will open
+  // just the default CF (Due to current limitation, DB cannot open without the
+  // default CF)
+  std::vector<ColumnFamilyDescriptor> column_families;
+  for (auto& cf : all_column_families) {
+    if (cf.name == compaction_input.cf_name) {
+      cf.options.comparator = override_options.comparator;
+      cf.options.merge_operator = override_options.merge_operator;
+      cf.options.compaction_filter = override_options.compaction_filter;
+      cf.options.compaction_filter_factory =
+          override_options.compaction_filter_factory;
+      cf.options.prefix_extractor = override_options.prefix_extractor;
+      cf.options.table_factory = override_options.table_factory;
+      cf.options.sst_partitioner_factory =
+          override_options.sst_partitioner_factory;
+      cf.options.table_properties_collector_factories =
+          override_options.table_properties_collector_factories;
+      column_families.emplace_back(cf);
+    } else if (cf.name == kDefaultColumnFamilyName) {
+      column_families.emplace_back(cf);
+    }
+  }
+
+  // 5. Open db As Secondary
+  DB* db;
+  std::vector<ColumnFamilyHandle*> handles;
+  s = DB::OpenAsSecondary(db_options, name, output_directory, column_families,
+                          &handles, &db);
+  if (!s.ok()) {
+    return s;
+  }
+  assert(db);
+
+  // 6. Find the handle of the Column Family that this will compact
+  ColumnFamilyHandle* cfh = nullptr;
+  for (auto* handle : handles) {
+    if (compaction_input.cf_name == handle->GetName()) {
+      cfh = handle;
+      break;
+    }
+  }
+  assert(cfh);
+
+  // 7. Run the compaction without installation.
+  // Output will be stored in the directory specified by output_directory
   CompactionServiceResult compaction_result;
   DBImplSecondary* db_secondary = static_cast_with_check<DBImplSecondary>(db);
-  assert(handles.size() > 0);
-  s = db_secondary->CompactWithoutInstallation(
-      options, handles[0], compaction_input, &compaction_result);
+  s = db_secondary->CompactWithoutInstallation(options, cfh, compaction_input,
+                                               &compaction_result);
 
+  // 8. Serialize the result
   Status serialization_status = compaction_result.Write(output);
 
+  // 9. Close the db and return
   for (auto& handle : handles) {
     delete handle;
   }
@@ -1019,6 +1096,5 @@ Status DB::OpenAndCompact(
   return OpenAndCompact(OpenAndCompactOptions(), name, output_directory, input,
                         output, override_options);
 }
-
 
 }  // namespace ROCKSDB_NAMESPACE

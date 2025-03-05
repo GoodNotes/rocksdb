@@ -13,14 +13,11 @@ namespace ROCKSDB_NAMESPACE {
 class AttributeGroupIteratorImpl : public AttributeGroupIterator {
  public:
   AttributeGroupIteratorImpl(
-      const Comparator* comparator,
-      const std::vector<ColumnFamilyHandle*>& column_families,
-      const std::vector<Iterator*>& child_iterators)
-      : impl_(
-            comparator, column_families, child_iterators, [this]() { Reset(); },
-            [this](ColumnFamilyHandle* cfh, Iterator* iter) {
-              AddToAttributeGroups(cfh, iter->columns());
-            }) {}
+      const ReadOptions& read_options, const Comparator* comparator,
+      std::vector<std::pair<ColumnFamilyHandle*, std::unique_ptr<Iterator>>>&&
+          cfh_iter_pairs)
+      : impl_(read_options, comparator, std::move(cfh_iter_pairs),
+              ResetFunc(this), PopulateFunc(this)) {}
   ~AttributeGroupIteratorImpl() override {}
 
   // No copy allowed
@@ -38,18 +35,45 @@ class AttributeGroupIteratorImpl : public AttributeGroupIterator {
   Slice key() const override { return impl_.key(); }
   Status status() const override { return impl_.status(); }
 
-  const AttributeGroups& attribute_groups() const override {
+  const IteratorAttributeGroups& attribute_groups() const override {
     assert(Valid());
     return attribute_groups_;
   }
 
   void Reset() { attribute_groups_.clear(); }
 
+  bool PrepareValue() override { return impl_.PrepareValue(); }
+
  private:
-  MultiCfIteratorImpl impl_;
-  AttributeGroups attribute_groups_;
-  void AddToAttributeGroups(ColumnFamilyHandle* cfh,
-                            const WideColumns& columns);
+  class ResetFunc {
+   public:
+    explicit ResetFunc(AttributeGroupIteratorImpl* iter) : iter_(iter) {}
+
+    void operator()() const {
+      assert(iter_);
+      iter_->Reset();
+    }
+
+   private:
+    AttributeGroupIteratorImpl* iter_;
+  };
+
+  class PopulateFunc {
+   public:
+    explicit PopulateFunc(AttributeGroupIteratorImpl* iter) : iter_(iter) {}
+
+    void operator()(const autovector<MultiCfIteratorInfo>& items) const {
+      assert(iter_);
+      iter_->AddToAttributeGroups(items);
+    }
+
+   private:
+    AttributeGroupIteratorImpl* iter_;
+  };
+
+  MultiCfIteratorImpl<ResetFunc, PopulateFunc> impl_;
+  IteratorAttributeGroups attribute_groups_;
+  void AddToAttributeGroups(const autovector<MultiCfIteratorInfo>& items);
 };
 
 class EmptyAttributeGroupIterator : public AttributeGroupIterator {
@@ -68,8 +92,8 @@ class EmptyAttributeGroupIterator : public AttributeGroupIterator {
   }
   Status status() const override { return status_; }
 
-  const AttributeGroups& attribute_groups() const override {
-    return kNoAttributeGroups;
+  const IteratorAttributeGroups& attribute_groups() const override {
+    return kNoIteratorAttributeGroups;
   }
 
  private:

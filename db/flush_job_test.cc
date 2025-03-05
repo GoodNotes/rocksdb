@@ -68,7 +68,8 @@ class FlushJobTestBase : public testing::Test {
   }
 
   void NewDB() {
-    ASSERT_OK(SetIdentityFile(WriteOptions(), env_, dbname_));
+    ASSERT_OK(
+        SetIdentityFile(WriteOptions(), env_, dbname_, Temperature::kUnknown));
     VersionEdit new_db;
 
     new_db.SetLogNumber(0);
@@ -114,7 +115,8 @@ class FlushJobTestBase : public testing::Test {
     }
     ASSERT_OK(s);
     // Make "CURRENT" file that points to the new manifest file.
-    s = SetCurrentFile(WriteOptions(), fs_.get(), dbname_, 1, nullptr);
+    s = SetCurrentFile(WriteOptions(), fs_.get(), dbname_, 1,
+                       Temperature::kUnknown, nullptr);
     ASSERT_OK(s);
   }
 
@@ -140,12 +142,13 @@ class FlushJobTestBase : public testing::Test {
       column_families.emplace_back(cf_name, cf_options_);
     }
 
-    versions_.reset(new VersionSet(
-        dbname_, &db_options_, env_options_, table_cache_.get(),
-        &write_buffer_manager_, &write_controller_,
-        /*block_cache_tracer=*/nullptr, /*io_tracer=*/nullptr,
-        /*db_id=*/"", /*db_session_id=*/"", /*daily_offpeak_time_utc=*/"",
-        /*error_handler=*/nullptr, /*read_only=*/false));
+    versions_.reset(
+        new VersionSet(dbname_, &db_options_, env_options_, table_cache_.get(),
+                       &write_buffer_manager_, &write_controller_,
+                       /*block_cache_tracer=*/nullptr, /*io_tracer=*/nullptr,
+                       test::kUnitTestDbId, /*db_session_id=*/"",
+                       /*daily_offpeak_time_utc=*/"",
+                       /*error_handler=*/nullptr, /*read_only=*/false));
     EXPECT_OK(versions_->Recover(column_families, false));
   }
 
@@ -186,7 +189,7 @@ TEST_F(FlushJobTest, Empty) {
   SnapshotChecker* snapshot_checker = nullptr;  // not relavant
   FlushJob flush_job(
       dbname_, versions_->GetColumnFamilySet()->GetDefault(), db_options_,
-      *cfd->GetLatestMutableCFOptions(),
+      cfd->GetLatestMutableCFOptions(),
       std::numeric_limits<uint64_t>::max() /* memtable_id */, env_options_,
       versions_.get(), &mutex_, &shutting_down_, {}, kMaxSequenceNumber,
       snapshot_checker, &job_context, FlushReason::kTest, nullptr, nullptr,
@@ -204,7 +207,7 @@ TEST_F(FlushJobTest, Empty) {
 TEST_F(FlushJobTest, NonEmpty) {
   JobContext job_context(0);
   auto cfd = versions_->GetColumnFamilySet()->GetDefault();
-  auto new_mem = cfd->ConstructNewMemtable(*cfd->GetLatestMutableCFOptions(),
+  auto new_mem = cfd->ConstructNewMemtable(cfd->GetLatestMutableCFOptions(),
                                            kMaxSequenceNumber);
   new_mem->Ref();
   auto inserted_keys = mock::MakeMockFile();
@@ -261,7 +264,7 @@ TEST_F(FlushJobTest, NonEmpty) {
   }
   mock::SortKVVector(&inserted_keys);
 
-  autovector<MemTable*> to_delete;
+  autovector<ReadOnlyMemTable*> to_delete;
   new_mem->ConstructFragmentedRangeTombstones();
   cfd->imm()->Add(new_mem, &to_delete);
   for (auto& m : to_delete) {
@@ -272,7 +275,7 @@ TEST_F(FlushJobTest, NonEmpty) {
   SnapshotChecker* snapshot_checker = nullptr;  // not relavant
   FlushJob flush_job(
       dbname_, versions_->GetColumnFamilySet()->GetDefault(), db_options_,
-      *cfd->GetLatestMutableCFOptions(),
+      cfd->GetLatestMutableCFOptions(),
       std::numeric_limits<uint64_t>::max() /* memtable_id */, env_options_,
       versions_.get(), &mutex_, &shutting_down_, {}, kMaxSequenceNumber,
       snapshot_checker, &job_context, FlushReason::kTest, nullptr, nullptr,
@@ -307,7 +310,7 @@ TEST_F(FlushJobTest, FlushMemTablesSingleColumnFamily) {
   std::vector<uint64_t> memtable_ids;
   std::vector<MemTable*> new_mems;
   for (size_t i = 0; i != num_mems; ++i) {
-    MemTable* mem = cfd->ConstructNewMemtable(*cfd->GetLatestMutableCFOptions(),
+    MemTable* mem = cfd->ConstructNewMemtable(cfd->GetLatestMutableCFOptions(),
                                               kMaxSequenceNumber);
     mem->SetID(i);
     mem->Ref();
@@ -322,7 +325,7 @@ TEST_F(FlushJobTest, FlushMemTablesSingleColumnFamily) {
     }
   }
 
-  autovector<MemTable*> to_delete;
+  autovector<ReadOnlyMemTable*> to_delete;
   for (auto mem : new_mems) {
     mem->ConstructFragmentedRangeTombstones();
     cfd->imm()->Add(mem, &to_delete);
@@ -336,7 +339,7 @@ TEST_F(FlushJobTest, FlushMemTablesSingleColumnFamily) {
   uint64_t flush_memtable_id = smallest_memtable_id + num_mems_to_flush - 1;
   FlushJob flush_job(
       dbname_, versions_->GetColumnFamilySet()->GetDefault(), db_options_,
-      *cfd->GetLatestMutableCFOptions(), flush_memtable_id, env_options_,
+      cfd->GetLatestMutableCFOptions(), flush_memtable_id, env_options_,
       versions_.get(), &mutex_, &shutting_down_, {}, kMaxSequenceNumber,
       snapshot_checker, &job_context, FlushReason::kTest, nullptr, nullptr,
       nullptr, kNoCompression, db_options_.statistics.get(), &event_logger,
@@ -377,14 +380,14 @@ TEST_F(FlushJobTest, FlushMemtablesMultipleColumnFamilies) {
   std::vector<uint64_t> memtable_ids;
   std::vector<SequenceNumber> smallest_seqs;
   std::vector<SequenceNumber> largest_seqs;
-  autovector<MemTable*> to_delete;
+  autovector<ReadOnlyMemTable*> to_delete;
   SequenceNumber curr_seqno = 0;
   size_t k = 0;
   for (auto cfd : all_cfds) {
     smallest_seqs.push_back(curr_seqno);
     for (size_t i = 0; i != num_memtables[k]; ++i) {
       MemTable* mem = cfd->ConstructNewMemtable(
-          *cfd->GetLatestMutableCFOptions(), kMaxSequenceNumber);
+          cfd->GetLatestMutableCFOptions(), kMaxSequenceNumber);
       mem->SetID(i);
       mem->Ref();
 
@@ -408,7 +411,7 @@ TEST_F(FlushJobTest, FlushMemtablesMultipleColumnFamilies) {
   for (auto cfd : all_cfds) {
     std::vector<SequenceNumber> snapshot_seqs;
     flush_jobs.emplace_back(new FlushJob(
-        dbname_, cfd, db_options_, *cfd->GetLatestMutableCFOptions(),
+        dbname_, cfd, db_options_, cfd->GetLatestMutableCFOptions(),
         memtable_ids[k], env_options_, versions_.get(), &mutex_,
         &shutting_down_, snapshot_seqs, kMaxSequenceNumber, snapshot_checker,
         &job_context, FlushReason::kTest, nullptr, nullptr, nullptr,
@@ -436,14 +439,10 @@ TEST_F(FlushJobTest, FlushMemtablesMultipleColumnFamilies) {
   for (auto& meta : file_metas) {
     file_meta_ptrs.push_back(&meta);
   }
-  autovector<const autovector<MemTable*>*> mems_list;
+  autovector<const autovector<ReadOnlyMemTable*>*> mems_list;
   for (size_t i = 0; i != all_cfds.size(); ++i) {
     const auto& mems = flush_jobs[i]->GetMemTables();
     mems_list.push_back(&mems);
-  }
-  autovector<const MutableCFOptions*> mutable_cf_options_list;
-  for (auto cfd : all_cfds) {
-    mutable_cf_options_list.push_back(cfd->GetLatestMutableCFOptions());
   }
   autovector<std::list<std::unique_ptr<FlushJobInfo>>*>
       committed_flush_jobs_info;
@@ -452,8 +451,8 @@ TEST_F(FlushJobTest, FlushMemtablesMultipleColumnFamilies) {
   }
 
   Status s = InstallMemtableAtomicFlushResults(
-      nullptr /* imm_lists */, all_cfds, mutable_cf_options_list, mems_list,
-      versions_.get(), nullptr /* prep_tracker */, &mutex_, file_meta_ptrs,
+      nullptr /* imm_lists */, all_cfds, mems_list, versions_.get(),
+      nullptr /* prep_tracker */, &mutex_, file_meta_ptrs,
       committed_flush_jobs_info, &job_context.memtables_to_free,
       nullptr /* db_directory */, nullptr /* log_buffer */);
   ASSERT_OK(s);
@@ -486,7 +485,7 @@ TEST_F(FlushJobTest, FlushMemtablesMultipleColumnFamilies) {
 TEST_F(FlushJobTest, Snapshots) {
   JobContext job_context(0);
   auto cfd = versions_->GetColumnFamilySet()->GetDefault();
-  auto new_mem = cfd->ConstructNewMemtable(*cfd->GetLatestMutableCFOptions(),
+  auto new_mem = cfd->ConstructNewMemtable(cfd->GetLatestMutableCFOptions(),
                                            kMaxSequenceNumber);
 
   std::set<SequenceNumber> snapshots_set;
@@ -525,7 +524,7 @@ TEST_F(FlushJobTest, Snapshots) {
   }
   mock::SortKVVector(&inserted_keys);
 
-  autovector<MemTable*> to_delete;
+  autovector<ReadOnlyMemTable*> to_delete;
   new_mem->ConstructFragmentedRangeTombstones();
   cfd->imm()->Add(new_mem, &to_delete);
   for (auto& m : to_delete) {
@@ -536,7 +535,7 @@ TEST_F(FlushJobTest, Snapshots) {
   SnapshotChecker* snapshot_checker = nullptr;  // not relavant
   FlushJob flush_job(
       dbname_, versions_->GetColumnFamilySet()->GetDefault(), db_options_,
-      *cfd->GetLatestMutableCFOptions(),
+      cfd->GetLatestMutableCFOptions(),
       std::numeric_limits<uint64_t>::max() /* memtable_id */, env_options_,
       versions_.get(), &mutex_, &shutting_down_, snapshots, kMaxSequenceNumber,
       snapshot_checker, &job_context, FlushReason::kTest, nullptr, nullptr,
@@ -564,7 +563,7 @@ TEST_F(FlushJobTest, GetRateLimiterPriorityForWrite) {
   std::vector<uint64_t> memtable_ids;
   std::vector<MemTable*> new_mems;
   for (size_t i = 0; i != num_mems; ++i) {
-    MemTable* mem = cfd->ConstructNewMemtable(*cfd->GetLatestMutableCFOptions(),
+    MemTable* mem = cfd->ConstructNewMemtable(cfd->GetLatestMutableCFOptions(),
                                               kMaxSequenceNumber);
     mem->SetID(i);
     mem->Ref();
@@ -579,7 +578,7 @@ TEST_F(FlushJobTest, GetRateLimiterPriorityForWrite) {
     }
   }
 
-  autovector<MemTable*> to_delete;
+  autovector<ReadOnlyMemTable*> to_delete;
   for (auto mem : new_mems) {
     mem->ConstructFragmentedRangeTombstones();
     cfd->imm()->Add(mem, &to_delete);
@@ -593,7 +592,7 @@ TEST_F(FlushJobTest, GetRateLimiterPriorityForWrite) {
   uint64_t flush_memtable_id = smallest_memtable_id + num_mems_to_flush - 1;
   FlushJob flush_job(
       dbname_, versions_->GetColumnFamilySet()->GetDefault(), db_options_,
-      *cfd->GetLatestMutableCFOptions(), flush_memtable_id, env_options_,
+      cfd->GetLatestMutableCFOptions(), flush_memtable_id, env_options_,
       versions_.get(), &mutex_, &shutting_down_, {}, kMaxSequenceNumber,
       snapshot_checker, &job_context, FlushReason::kTest, nullptr, nullptr,
       nullptr, kNoCompression, db_options_.statistics.get(), &event_logger,
@@ -624,7 +623,7 @@ TEST_F(FlushJobTest, GetRateLimiterPriorityForWrite) {
 TEST_F(FlushJobTest, ReplaceTimedPutWriteTimeWithPreferredSeqno) {
   JobContext job_context(0);
   auto cfd = versions_->GetColumnFamilySet()->GetDefault();
-  auto new_mem = cfd->ConstructNewMemtable(*cfd->GetLatestMutableCFOptions(),
+  auto new_mem = cfd->ConstructNewMemtable(cfd->GetLatestMutableCFOptions(),
                                            kMaxSequenceNumber);
   new_mem->Ref();
   std::shared_ptr<SeqnoToTimeMapping> seqno_to_time_mapping =
@@ -651,7 +650,7 @@ TEST_F(FlushJobTest, ReplaceTimedPutWriteTimeWithPreferredSeqno) {
   InternalKey largest_internal_key("foo", SequenceNumber(18), kTypeValue);
   inserted_entries.push_back(
       {largest_internal_key.Encode().ToString(), "fval"});
-  autovector<MemTable*> to_delete;
+  autovector<ReadOnlyMemTable*> to_delete;
   new_mem->ConstructFragmentedRangeTombstones();
   cfd->imm()->Add(new_mem, &to_delete);
   for (auto& m : to_delete) {
@@ -662,7 +661,7 @@ TEST_F(FlushJobTest, ReplaceTimedPutWriteTimeWithPreferredSeqno) {
   SnapshotChecker* snapshot_checker = nullptr;  // not relevant
   FlushJob flush_job(
       dbname_, versions_->GetColumnFamilySet()->GetDefault(), db_options_,
-      *cfd->GetLatestMutableCFOptions(),
+      cfd->GetLatestMutableCFOptions(),
       std::numeric_limits<uint64_t>::max() /* memtable_id */, env_options_,
       versions_.get(), &mutex_, &shutting_down_, {}, kMaxSequenceNumber,
       snapshot_checker, &job_context, FlushReason::kTest, nullptr, nullptr,
@@ -741,11 +740,11 @@ class FlushJobTimestampTest
 
 TEST_P(FlushJobTimestampTest, AllKeysExpired) {
   ColumnFamilyData* cfd = versions_->GetColumnFamilySet()->GetDefault();
-  autovector<MemTable*> to_delete;
+  autovector<ReadOnlyMemTable*> to_delete;
 
   {
     MemTable* new_mem = cfd->ConstructNewMemtable(
-        *cfd->GetLatestMutableCFOptions(), kMaxSequenceNumber);
+        cfd->GetLatestMutableCFOptions(), kMaxSequenceNumber);
     new_mem->Ref();
     for (int i = 0; i < 100; ++i) {
       uint64_t ts = curr_ts_.fetch_add(1);
@@ -769,7 +768,7 @@ TEST_P(FlushJobTimestampTest, AllKeysExpired) {
   PutFixed64(&full_history_ts_low, std::numeric_limits<uint64_t>::max());
   cfd->SetFullHistoryTsLow(full_history_ts_low);
   FlushJob flush_job(
-      dbname_, cfd, db_options_, *cfd->GetLatestMutableCFOptions(),
+      dbname_, cfd, db_options_, cfd->GetLatestMutableCFOptions(),
       std::numeric_limits<uint64_t>::max() /* memtable_id */, env_options_,
       versions_.get(), &mutex_, &shutting_down_, snapshots, kMaxSequenceNumber,
       snapshot_checker, &job_context, FlushReason::kTest, nullptr, nullptr,
@@ -807,11 +806,11 @@ TEST_P(FlushJobTimestampTest, AllKeysExpired) {
 
 TEST_P(FlushJobTimestampTest, NoKeyExpired) {
   ColumnFamilyData* cfd = versions_->GetColumnFamilySet()->GetDefault();
-  autovector<MemTable*> to_delete;
+  autovector<ReadOnlyMemTable*> to_delete;
 
   {
     MemTable* new_mem = cfd->ConstructNewMemtable(
-        *cfd->GetLatestMutableCFOptions(), kMaxSequenceNumber);
+        cfd->GetLatestMutableCFOptions(), kMaxSequenceNumber);
     new_mem->Ref();
     for (int i = 0; i < 100; ++i) {
       uint64_t ts = curr_ts_.fetch_add(1);
@@ -831,7 +830,7 @@ TEST_P(FlushJobTimestampTest, NoKeyExpired) {
   PutFixed64(&full_history_ts_low, 0);
   cfd->SetFullHistoryTsLow(full_history_ts_low);
   FlushJob flush_job(
-      dbname_, cfd, db_options_, *cfd->GetLatestMutableCFOptions(),
+      dbname_, cfd, db_options_, cfd->GetLatestMutableCFOptions(),
       std::numeric_limits<uint64_t>::max() /* memtable_id */, env_options_,
       versions_.get(), &mutex_, &shutting_down_, snapshots, kMaxSequenceNumber,
       snapshot_checker, &job_context, FlushReason::kTest, nullptr, nullptr,
@@ -871,9 +870,15 @@ TEST_P(FlushJobTimestampTest, NoKeyExpired) {
       expected_full_history_ts_low = full_history_ts_low;
     }
     InternalKey smallest(smallest_key, curr_seq_ - 1, ValueType::kTypeValue);
-    InternalKey largest(largest_key, kStartSeq, ValueType::kTypeValue);
-    CheckFileMetaData(cfd, smallest, largest, &fmeta);
-    CheckFullHistoryTsLow(cfd, expected_full_history_ts_low);
+    if (!persist_udt_) {
+      InternalKey largest(largest_key, curr_seq_ - 1, ValueType::kTypeValue);
+      CheckFileMetaData(cfd, smallest, largest, &fmeta);
+      CheckFullHistoryTsLow(cfd, expected_full_history_ts_low);
+    } else {
+      InternalKey largest(largest_key, kStartSeq, ValueType::kTypeValue);
+      CheckFileMetaData(cfd, smallest, largest, &fmeta);
+      CheckFullHistoryTsLow(cfd, expected_full_history_ts_low);
+    }
   }
   job_context.Clean();
   ASSERT_TRUE(to_delete.empty());

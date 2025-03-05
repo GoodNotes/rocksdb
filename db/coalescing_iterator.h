@@ -9,17 +9,14 @@
 
 namespace ROCKSDB_NAMESPACE {
 
-// UNDER CONSTRUCTION - DO NOT USE
 class CoalescingIterator : public Iterator {
  public:
-  CoalescingIterator(const Comparator* comparator,
-                     const std::vector<ColumnFamilyHandle*>& column_families,
-                     const std::vector<Iterator*>& child_iterators)
-      : impl_(
-            comparator, column_families, child_iterators, [this]() { Reset(); },
-            [this](ColumnFamilyHandle*, Iterator* iter) {
-              Coalesce(iter->columns());
-            }) {}
+  CoalescingIterator(
+      const ReadOptions& read_options, const Comparator* comparator,
+      std::vector<std::pair<ColumnFamilyHandle*, std::unique_ptr<Iterator>>>&&
+          cfh_iter_pairs)
+      : impl_(read_options, comparator, std::move(cfh_iter_pairs),
+              ResetFunc(this), PopulateFunc(this)) {}
   ~CoalescingIterator() override {}
 
   // No copy allowed
@@ -50,12 +47,58 @@ class CoalescingIterator : public Iterator {
     wide_columns_.clear();
   }
 
+  bool PrepareValue() override { return impl_.PrepareValue(); }
+
  private:
-  MultiCfIteratorImpl impl_;
+  class ResetFunc {
+   public:
+    explicit ResetFunc(CoalescingIterator* iter) : iter_(iter) {}
+
+    void operator()() const {
+      assert(iter_);
+      iter_->Reset();
+    }
+
+   private:
+    CoalescingIterator* iter_;
+  };
+
+  class PopulateFunc {
+   public:
+    explicit PopulateFunc(CoalescingIterator* iter) : iter_(iter) {}
+
+    void operator()(const autovector<MultiCfIteratorInfo>& items) const {
+      assert(iter_);
+      iter_->Coalesce(items);
+    }
+
+   private:
+    CoalescingIterator* iter_;
+  };
+
+  MultiCfIteratorImpl<ResetFunc, PopulateFunc> impl_;
   Slice value_;
   WideColumns wide_columns_;
 
-  void Coalesce(const WideColumns& columns);
+  struct WideColumnWithOrder {
+    const WideColumn* column;
+    int order;
+  };
+
+  class WideColumnWithOrderComparator {
+   public:
+    explicit WideColumnWithOrderComparator() {}
+    bool operator()(const WideColumnWithOrder& a,
+                    const WideColumnWithOrder& b) const {
+      int c = a.column->name().compare(b.column->name());
+      return c == 0 ? a.order - b.order > 0 : c > 0;
+    }
+  };
+
+  using MinHeap =
+      BinaryHeap<WideColumnWithOrder, WideColumnWithOrderComparator>;
+
+  void Coalesce(const autovector<MultiCfIteratorInfo>& items);
 };
 
 }  // namespace ROCKSDB_NAMESPACE

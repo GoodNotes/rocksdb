@@ -32,7 +32,7 @@
 # 3. cmake ..
 # 4. make -j
 
-cmake_minimum_required(VERSION 3.10)
+cmake_minimum_required(VERSION 3.12)
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_LIST_DIR}/cmake/modules/")
 include(ReadVersion)
@@ -267,8 +267,8 @@ endif(CMAKE_SYSTEM_PROCESSOR MATCHES "s390x")
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "loongarch64")
   CHECK_C_COMPILER_FLAG("-march=loongarch64" HAS_LOONGARCH64)
   if(HAS_LOONGARCH64)
-    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -mcpu=loongarch64 -mtune=loongarch64")
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mcpu=loongarch64 -mtune=loongarch64")
+    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -march=loongarch64 -mtune=loongarch64")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -march=loongarch64 -mtune=loongarch64")
   endif(HAS_LOONGARCH64)
 endif(CMAKE_SYSTEM_PROCESSOR MATCHES "loongarch64")
 
@@ -488,6 +488,8 @@ if(CMAKE_SYSTEM_NAME MATCHES "Cygwin")
   add_definitions(-fno-builtin-memcmp -DCYGWIN)
 elseif(CMAKE_SYSTEM_NAME MATCHES "Darwin")
   add_definitions(-DOS_MACOSX)
+elseif(CMAKE_SYSTEM_NAME MATCHES "iOS")
+  add_definitions(-DOS_MACOSX -DIOS_CROSS_COMPILE)
 elseif(CMAKE_SYSTEM_NAME MATCHES "Linux")
   add_definitions(-DOS_LINUX)
 elseif(CMAKE_SYSTEM_NAME MATCHES "SunOS")
@@ -615,7 +617,7 @@ if(USE_FOLLY)
     FMT_INST_PATH)
     exec_program(ls ARGS -d ${FOLLY_INST_PATH}/../gflags* OUTPUT_VARIABLE
     GFLAGS_INST_PATH)
-    set(Boost_DIR ${BOOST_INST_PATH}/lib/cmake/Boost-1.78.0)
+    set(Boost_DIR ${BOOST_INST_PATH}/lib/cmake/Boost-1.83.0)
     if(EXISTS ${FMT_INST_PATH}/lib64)
       set(fmt_DIR ${FMT_INST_PATH}/lib64/cmake/fmt)
     else()
@@ -691,6 +693,7 @@ set(SOURCES
         db/db_impl/db_impl_write.cc
         db/db_impl/db_impl_compaction_flush.cc
         db/db_impl/db_impl_files.cc
+        db/db_impl/db_impl_follower.cc
         db/db_impl/db_impl_open.cc
         db/db_impl/db_impl_debug.cc
         db/db_impl/db_impl_experimental.cc
@@ -713,6 +716,7 @@ set(SOURCES
         db/log_reader.cc
         db/log_writer.cc
         db/malloc_stats.cc
+        db/manifest_ops.cc
         db/memtable.cc
         db/memtable_list.cc
         db/merge_helper.cc
@@ -748,6 +752,7 @@ set(SOURCES
         env/env_encryption.cc
         env/file_system.cc
         env/file_system_tracer.cc
+        env/fs_on_demand.cc
         env/fs_remap.cc
         env/mock_env.cc
         env/unique_id_gen.cc
@@ -775,6 +780,7 @@ set(SOURCES
         memtable/hash_skiplist_rep.cc
         memtable/skiplistrep.cc
         memtable/vectorrep.cc
+        memtable/wbwi_memtable.cc
         memtable/write_buffer_manager.cc
         monitoring/histogram.cc
         monitoring/histogram_windowing.cc
@@ -829,6 +835,7 @@ set(SOURCES
         table/cuckoo/cuckoo_table_builder.cc
         table/cuckoo/cuckoo_table_factory.cc
         table/cuckoo/cuckoo_table_reader.cc
+        table/external_table_reader.cc
         table/format.cc
         table/get_context.cc
         table/iterator.cc
@@ -933,8 +940,11 @@ set(SOURCES
         utilities/persistent_cache/block_cache_tier_metadata.cc
         utilities/persistent_cache/persistent_cache_tier.cc
         utilities/persistent_cache/volatile_tier_impl.cc
+        utilities/secondary_index/secondary_index_iterator.cc
+        utilities/secondary_index/simple_secondary_index.cc
         utilities/simulator_cache/cache_simulator.cc
         utilities/simulator_cache/sim_cache.cc
+        utilities/table_properties_collectors/compact_for_tiering_collector.cc
         utilities/table_properties_collectors/compact_on_deletion_collector.cc
         utilities/trace/file_trace_reader_writer.cc
         utilities/trace/replayer_impl.cc
@@ -1047,6 +1057,7 @@ if(USE_FOLLY_LITE)
   list(APPEND SOURCES
     third-party/folly/folly/container/detail/F14Table.cpp
     third-party/folly/folly/detail/Futex.cpp
+    third-party/folly/folly/lang/Exception.cpp
     third-party/folly/folly/lang/SafeAssert.cpp
     third-party/folly/folly/lang/ToAscii.cpp
     third-party/folly/folly/ScopeGuard.cpp
@@ -1054,6 +1065,12 @@ if(USE_FOLLY_LITE)
     third-party/folly/folly/synchronization/DistributedMutex.cpp
     third-party/folly/folly/synchronization/ParkingLot.cpp)
   include_directories(${PROJECT_SOURCE_DIR}/third-party/folly)
+  exec_program(python3 ${PROJECT_SOURCE_DIR}/third-party/folly ARGS
+  build/fbcode_builder/getdeps.py show-source-dir boost OUTPUT_VARIABLE
+  BOOST_SOURCE_PATH)
+  exec_program(ls ARGS -d ${BOOST_SOURCE_PATH}/boost* OUTPUT_VARIABLE
+  BOOST_INCLUDE_DIR)
+  include_directories(${BOOST_INCLUDE_DIR})
   add_definitions(-DUSE_FOLLY -DFOLLY_NO_CONFIG)
   list(APPEND THIRDPARTY_LIBS glog)
 endif()
@@ -1363,6 +1380,7 @@ if(WITH_TESTS)
         db/file_indexer_test.cc
         db/filename_test.cc
         db/flush_job_test.cc
+        db/db_follower_test.cc
         db/import_column_family_test.cc
         db/listener_test.cc
         db/log_test.cc
@@ -1476,6 +1494,7 @@ if(WITH_TESTS)
         utilities/persistent_cache/persistent_cache_test.cc
         utilities/simulator_cache/cache_simulator_test.cc
         utilities/simulator_cache/sim_cache_test.cc
+        utilities/table_properties_collectors/compact_for_tiering_collector_test.cc
         utilities/table_properties_collectors/compact_on_deletion_collector_test.cc
         utilities/transactions/optimistic_transaction_test.cc
         utilities/transactions/transaction_test.cc
@@ -1555,6 +1574,7 @@ if(WITH_BENCHMARK_TOOLS)
   add_executable(db_bench${ARTIFACT_SUFFIX}
     tools/simulated_hybrid_file_system.cc
     tools/db_bench.cc
+    tools/tool_hooks.cc
     tools/db_bench_tool.cc)
   target_link_libraries(db_bench${ARTIFACT_SUFFIX}
     ${ROCKSDB_LIB} ${THIRDPARTY_LIBS})

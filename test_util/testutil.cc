@@ -46,6 +46,7 @@ const std::set<uint32_t> kFooterFormatVersionsToTest{
     kDefaultFormatVersion,
     kLatestFormatVersion,
 };
+const ReadOptionsNoIo kReadOptionsNoIo;
 
 std::string RandomKey(Random* rnd, int len, RandomKeyType type) {
   // Make sure to generate a wide variety of characters so we
@@ -307,6 +308,7 @@ void RandomInitDBOptions(DBOptions* db_opt, Random* rnd) {
   db_opt->is_fd_close_on_exec = rnd->Uniform(2);
   db_opt->paranoid_checks = rnd->Uniform(2);
   db_opt->track_and_verify_wals_in_manifest = rnd->Uniform(2);
+  db_opt->track_and_verify_wals = rnd->Uniform(2);
   db_opt->verify_sst_unique_id_in_manifest = rnd->Uniform(2);
   db_opt->skip_stats_update_on_db_open = rnd->Uniform(2);
   db_opt->skip_checking_sst_file_sizes_on_db_open = rnd->Uniform(2);
@@ -565,6 +567,30 @@ void DeleteDir(Env* env, const std::string& dirname) {
   TryDeleteDir(env, dirname).PermitUncheckedError();
 }
 
+FileType GetFileType(const std::string& path) {
+  FileType type = kTempFile;
+  std::size_t found = path.find_last_of('/');
+  if (found == std::string::npos) {
+    found = 0;
+  }
+  std::string file_name = path.substr(found);
+  uint64_t number = 0;
+  ParseFileName(file_name, &number, &type);
+  return type;
+}
+
+uint64_t GetFileNumber(const std::string& path) {
+  FileType type = kTempFile;
+  std::size_t found = path.find_last_of('/');
+  if (found == std::string::npos) {
+    found = 0;
+  }
+  std::string file_name = path.substr(found);
+  uint64_t number = 0;
+  ParseFileName(file_name, &number, &type);
+  return number;
+}
+
 Status CreateEnvFromSystem(const ConfigOptions& config_options, Env** result,
                            std::shared_ptr<Env>* guard) {
   const char* env_uri = getenv("TEST_ENV_URI");
@@ -740,7 +766,6 @@ int RegisterTestObjects(ObjectLibrary& library, const std::string& arg) {
   return static_cast<int>(library.GetFactoryCount(&num_types));
 }
 
-
 void RegisterTestLibrary(const std::string& arg) {
   static bool registered = false;
   if (!registered) {
@@ -748,4 +773,6 @@ void RegisterTestLibrary(const std::string& arg) {
     ObjectRegistry::Default()->AddLibrary("test", RegisterTestObjects, arg);
   }
 }
+
+const std::string kUnitTestDbId = "UnitTest";
 }  // namespace ROCKSDB_NAMESPACE::test

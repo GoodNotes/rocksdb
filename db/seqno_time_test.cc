@@ -612,12 +612,12 @@ TEST_P(SeqnoTimeTablePropTest, MultiCFs) {
   ASSERT_GE(seqs.size(), 99);
   ASSERT_LE(seqs.size(), 101);
 
-    for (int i = 0; i < 200; i++) {
-      ASSERT_OK(Put(0, Key(i), "value"));
-      dbfull()->TEST_WaitForPeriodicTaskRun(
-          [&] { mock_clock_->MockSleepForSeconds(static_cast<int>(100)); });
-    }
-    ASSERT_OK(Flush(0));
+  for (int i = 0; i < 200; i++) {
+    ASSERT_OK(Put(0, Key(i), "value"));
+    dbfull()->TEST_WaitForPeriodicTaskRun(
+        [&] { mock_clock_->MockSleepForSeconds(static_cast<int>(100)); });
+  }
+  ASSERT_OK(Flush(0));
   ASSERT_OK(dbfull()->TEST_WaitForCompact());
   tables_props.clear();
   ASSERT_OK(dbfull()->GetPropertiesOfAllTables(handles_[0], &tables_props));
@@ -919,10 +919,11 @@ TEST_P(SeqnoTimeTablePropTest, PrePopulateInDB) {
       ASSERT_EQ(db_->GetLatestSequenceNumber(), 0);
 
       // And even if we re-open read-write, we do not get pre-population,
-      // because that's only for new DBs.
+      // because that's only for new DBs. We just get a single bootstrap
+      // entry as a lower bound on write times of future writes.
       Reopen(track_options);
       sttm = dbfull()->TEST_GetSeqnoToTimeMapping();
-      ASSERT_EQ(sttm.Size(), 0);
+      ASSERT_EQ(sttm.Size(), 1);
       ASSERT_EQ(db_->GetLatestSequenceNumber(), 0);
     }
   }
@@ -1642,7 +1643,6 @@ TEST(PackValueAndWriteTimeTest, Basic) {
 }
 
 }  // namespace ROCKSDB_NAMESPACE
-
 
 int main(int argc, char** argv) {
   ROCKSDB_NAMESPACE::port::InstallStackTraceHandler();

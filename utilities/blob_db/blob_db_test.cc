@@ -3,7 +3,6 @@
 //  COPYING file in the root directory) and Apache 2.0 License
 //  (found in the LICENSE.Apache file in the root directory).
 
-
 #include "utilities/blob_db/blob_db.h"
 
 #include <algorithm>
@@ -760,7 +759,7 @@ TEST_F(BlobDBTest, SstFileManager) {
   // run the same test for Get(), MultiGet() and Iterator each.
   std::shared_ptr<SstFileManager> sst_file_manager(
       NewSstFileManager(mock_env_.get()));
-  sst_file_manager->SetDeleteRateBytesPerSecond(1);
+  sst_file_manager->SetDeleteRateBytesPerSecond(1024 * 1024);
   SstFileManagerImpl *sfm =
       static_cast<SstFileManagerImpl *>(sst_file_manager.get());
 
@@ -818,7 +817,7 @@ TEST_F(BlobDBTest, SstFileManagerRestart) {
   // run the same test for Get(), MultiGet() and Iterator each.
   std::shared_ptr<SstFileManager> sst_file_manager(
       NewSstFileManager(mock_env_.get()));
-  sst_file_manager->SetDeleteRateBytesPerSecond(1);
+  sst_file_manager->SetDeleteRateBytesPerSecond(1024 * 1024);
   SstFileManagerImpl *sfm =
       static_cast<SstFileManagerImpl *>(sst_file_manager.get());
 

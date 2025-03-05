@@ -61,21 +61,12 @@ enum CompactionPri : char {
   kRoundRobin = 0x4,
 };
 
-// Temperature of a file. Used to pass to FileSystem for a different
-// placement and/or coding.
-// Reserve some numbers in the middle, in case we need to insert new tier
-// there.
-enum class Temperature : uint8_t {
-  kUnknown = 0,
-  kHot = 0x04,
-  kWarm = 0x08,
-  kCold = 0x0C,
-  kLastTemperature,
-};
-
 struct FileTemperatureAge {
   Temperature temperature = Temperature::kUnknown;
   uint64_t age = 0;
+#if __cplusplus >= 202002L
+  bool operator==(const FileTemperatureAge& rhs) const = default;
+#endif
 };
 
 struct CompactionOptionsFIFO {
@@ -101,7 +92,10 @@ struct CompactionOptionsFIFO {
   // Age (in seconds) threshold for different file temperatures.
   // When not empty, each element specifies an age threshold `age` and a
   // temperature such that if all the data in a file is older than `age`,
-  // RocksDB will compact the file to the specified `temperature`.
+  // RocksDB will compact the file to the specified `temperature`. Oldest file
+  // will be considered first. Only one file is compacted at a time,
+  // so multiple files qualifying to be compacted to be same temperature
+  // won't be merged together.
   //
   // Note:
   // - Flushed files will always have temperature kUnknown.
@@ -125,6 +119,10 @@ struct CompactionOptionsFIFO {
   CompactionOptionsFIFO(uint64_t _max_table_files_size, bool _allow_compaction)
       : max_table_files_size(_max_table_files_size),
         allow_compaction(_allow_compaction) {}
+
+#if __cplusplus >= 202002L
+  bool operator==(const CompactionOptionsFIFO& rhs) const = default;
+#endif
 };
 
 // The control option of how the cache tiers will be used. Currently rocksdb
@@ -229,11 +227,18 @@ struct AdvancedColumnFamilyOptions {
   // if it is not explicitly set by the user.  Otherwise, the default is 0.
   int64_t max_write_buffer_size_to_maintain = 0;
 
-  // Allows thread-safe inplace updates. If this is true, there is no way to
+  // Allows thread-safe inplace updates.
+  //
+  // If this is true, there is no way to
   // achieve point-in-time consistency using snapshot or iterator (assuming
   // concurrent updates). Hence iterator and multi-get will return results
   // which are not consistent as of any point-in-time.
+  //
   // Backward iteration on memtables will not work either.
+  //
+  // It is intended to work or be compatible with a limited set of features:
+  // (1) Non-snapshot Get()
+  //
   // If inplace_callback function is not set,
   //   Put(key, new_value) will update inplace the existing_value iff
   //   * key exists in current memtable
@@ -714,6 +719,17 @@ struct AdvancedColumnFamilyOptions {
   // Dynamically changeable through SetOptions() API
   bool report_bg_io_stats = false;
 
+  // Setting this option to true disallows ordinary writes to the column family
+  // and it can only be populated through import and ingestion. It is intended
+  // to protect "ingestion only" column families. This option is not currently
+  // supported on the default column family because of error handling challenges
+  // analogous to https://github.com/facebook/rocksdb/issues/13429
+  //
+  // This option is not mutable with SetOptions(). It can be changed between
+  // DB::Open() calls, but open will fail if recovering WAL writes to a CF with
+  // this option set.
+  bool disallow_memtable_writes = false;
+
   // This option has different meanings for different compaction styles:
   //
   // Leveled: Non-bottom-level files with all keys older than TTL will go
@@ -806,7 +822,7 @@ struct AdvancedColumnFamilyOptions {
   // If this option is set, when creating the last level files, pass this
   // temperature to FileSystem used. Should be no-op for default FileSystem
   // and users need to plug in their own FileSystem to take advantage of it.
-  // When using FIFO compaction, this option is ignored.
+  // Currently only compatible with universal compaction.
   //
   // Dynamically changeable through the SetOptions() API
   Temperature last_level_temperature = Temperature::kUnknown;
@@ -934,13 +950,12 @@ struct AdvancedColumnFamilyOptions {
   // Dynamically changeable through the SetOptions() API
   double blob_garbage_collection_age_cutoff = 0.25;
 
-  // If the ratio of garbage in the oldest blob files exceeds this threshold,
-  // targeted compactions are scheduled in order to force garbage collecting
-  // the blob files in question, assuming they are all eligible based on the
-  // value of blob_garbage_collection_age_cutoff above. This option is
-  // currently only supported with leveled compactions.
-  // Note that enable_blob_garbage_collection has to be set in order for this
-  // option to have any effect.
+  // If the ratio of garbage in the blob files currently eligible for garbage
+  // collection exceeds this threshold, targeted compactions are scheduled in
+  // order to force garbage collecting the oldest blob files. This option is
+  // currently only supported with leveled compactions. Note that
+  // enable_blob_garbage_collection has to be set in order for this option to
+  // have any effect.
   //
   // Default: 1.0
   //
@@ -1030,8 +1045,10 @@ struct AdvancedColumnFamilyOptions {
   // When setting this flag to `false`, users should also call
   // `DB::IncreaseFullHistoryTsLow` to set a cutoff timestamp for flush. RocksDB
   // refrains from flushing a memtable with data still above
-  // the cutoff timestamp with best effort. If this cutoff timestamp is not set,
-  // flushing continues normally.
+  // the cutoff timestamp with best effort. One limitation of this best effort
+  // is that when `max_write_buffer_number` is equal to or smaller than 2,
+  // RocksDB will not attempt to retain user-defined timestamps, all flush jobs
+  // continue normally.
   //
   // Users can do user-defined
   // multi-versioned read above the cutoff timestamp. When users try to read
@@ -1080,6 +1097,13 @@ struct AdvancedColumnFamilyOptions {
   // Default: 0 (no delay)
   // Dynamically changeable through the SetOptions() API.
   uint32_t bottommost_file_compaction_delay = 0;
+
+  // Enables additional integrity checks during reads/scans.
+  // Specifically, for skiplist-based memtables, we verify that keys visited
+  // are in order. This is helpful to detect corrupted memtable keys during
+  // reads. Enabling this feature incurs a performance overhead due to an
+  // additional key comparison during memtable lookup.
+  bool paranoid_memory_checks = false;
 
   // Create ColumnFamilyOptions with default values for all fields
   AdvancedColumnFamilyOptions();
