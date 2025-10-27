@@ -200,7 +200,6 @@ TEST_F(OptionsTest, GetOptionsFromMapTest) {
   ASSERT_EQ(new_cf_opt.write_buffer_size, 1U);
   ASSERT_EQ(new_cf_opt.max_write_buffer_number, 2);
   ASSERT_EQ(new_cf_opt.min_write_buffer_number_to_merge, 3);
-  ASSERT_EQ(new_cf_opt.max_write_buffer_number_to_maintain, 99);
   ASSERT_EQ(new_cf_opt.max_write_buffer_size_to_maintain, -99999);
   ASSERT_EQ(new_cf_opt.compression, kSnappyCompression);
   ASSERT_EQ(new_cf_opt.compression_per_level.size(), 8U);
@@ -1722,6 +1721,9 @@ TEST_F(OptionsTest, MutableCFOptions) {
   ASSERT_OK(GetColumnFamilyOptionsFromString(
       config_options, cf_opts,
       "paranoid_file_checks=true; block_based_table_factory.block_align=false; "
+      "block_based_table_factory.super_block_alignment_size=65536; "
+      "block_based_table_factory.super_block_alignment_space_overhead_ratio="
+      "4096; "
       "block_based_table_factory.block_size=8192;",
       &cf_opts));
   ASSERT_TRUE(cf_opts.paranoid_file_checks);
@@ -1730,6 +1732,8 @@ TEST_F(OptionsTest, MutableCFOptions) {
   ASSERT_NE(bbto, nullptr);
   ASSERT_EQ(bbto->block_size, 8192);
   ASSERT_EQ(bbto->block_align, false);
+  ASSERT_EQ(bbto->super_block_alignment_size, 65536);
+  ASSERT_EQ(bbto->super_block_alignment_space_overhead_ratio, 4096);
   std::unordered_map<std::string, std::string> unused_opts;
   ASSERT_OK(GetColumnFamilyOptionsFromMap(
       config_options, cf_opts, {{"paranoid_file_checks", "false"}}, &cf_opts));
@@ -2032,7 +2036,7 @@ TEST_F(OptionsTest, GetStringFromCompressionType) {
   ASSERT_EQ(res, "kZlibCompression");
 
   ASSERT_NOK(
-      GetStringFromCompressionType(&res, static_cast<CompressionType>(-10)));
+      GetStringFromCompressionType(&res, static_cast<CompressionType>(0x7F)));
 }
 
 TEST_F(OptionsTest, OnlyMutableDBOptions) {
@@ -2498,7 +2502,6 @@ TEST_F(OptionsOldApiTest, GetOptionsFromMapTest) {
   ASSERT_EQ(new_cf_opt.write_buffer_size, 1U);
   ASSERT_EQ(new_cf_opt.max_write_buffer_number, 2);
   ASSERT_EQ(new_cf_opt.min_write_buffer_number_to_merge, 3);
-  ASSERT_EQ(new_cf_opt.max_write_buffer_number_to_maintain, 99);
   ASSERT_EQ(new_cf_opt.max_write_buffer_size_to_maintain, -99999);
   ASSERT_EQ(new_cf_opt.compression, kSnappyCompression);
   ASSERT_EQ(new_cf_opt.compression_per_level.size(), 8U);

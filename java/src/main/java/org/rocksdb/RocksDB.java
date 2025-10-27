@@ -84,13 +84,7 @@ public class RocksDB extends RocksObject {
       return;
     }
 
-    while (libraryLoaded.get() == LibraryState.LOADING) {
-      try {
-        Thread.sleep(10);
-      } catch(final InterruptedException e) {
-        //ignore
-      }
-    }
+    waitForLibraryToBeLoaded();
   }
 
   /**
@@ -146,12 +140,28 @@ public class RocksDB extends RocksObject {
       return;
     }
 
-    while (libraryLoaded.get() == LibraryState.LOADING) {
-      try {
-        Thread.sleep(10);
-      } catch(final InterruptedException e) {
-        //ignore
+    waitForLibraryToBeLoaded();
+  }
+
+  private static void waitForLibraryToBeLoaded() {
+    final long wait = 10; // Time to wait before re-checking if another thread loaded the library
+    final long timeout =
+        10 * 1000; // Maximum time to wait for another thread to load the library (10 seconds)
+    long waited = 0;
+    try {
+      while (libraryLoaded.get() == LibraryState.LOADING) {
+        Thread.sleep(wait);
+        waited += wait;
+
+        if (waited >= timeout) {
+          throw new RuntimeException(
+              "Exceeded timeout whilst trying to load the RocksDB shared library");
+        }
       }
+    } catch (final InterruptedException e) {
+      // restore interrupted status
+      Thread.currentThread().interrupt();
+      throw new RuntimeException("Interrupted whilst trying to load the RocksDB shared library", e);
     }
   }
 
@@ -4126,6 +4136,7 @@ public class RocksDB extends RocksObject {
    *
    * @return the maximum level
    */
+  @Deprecated
   public int maxMemCompactionLevel() {
     return maxMemCompactionLevel(null);
   }
@@ -4633,10 +4644,13 @@ public class RocksDB extends RocksObject {
    * @param targetLevel the target level for L0
    *
    * @throws RocksDBException if an error occurs whilst promoting L0
+   *
+   * @deprecated this API may be removed in a future release.
    */
+  @Deprecated
   public void promoteL0(
-      /* @Nullable */final ColumnFamilyHandle columnFamilyHandle,
-      final int targetLevel) throws RocksDBException {
+      /* @Nullable */ final ColumnFamilyHandle columnFamilyHandle, final int targetLevel)
+      throws RocksDBException {
     promoteL0(nativeHandle_,
         columnFamilyHandle == null ? 0 : columnFamilyHandle.nativeHandle_,
         targetLevel);
@@ -4648,9 +4662,11 @@ public class RocksDB extends RocksObject {
    * @param targetLevel the target level for L0
    *
    * @throws RocksDBException if an error occurs whilst promoting L0
+   *
+   * @deprecated this API may be removed in a future release.
    */
-  public void promoteL0(final int targetLevel)
-      throws RocksDBException {
+  @Deprecated
+  public void promoteL0(final int targetLevel) throws RocksDBException {
     promoteL0(null, targetLevel);
   }
 

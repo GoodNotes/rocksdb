@@ -161,6 +161,7 @@ TEST_F(DBBasicTest, UniqueSession) {
 
   ASSERT_EQ(sid2, sid3);
 
+  DestroyAndReopen(options);
   CreateAndReopenWithCF({"goku"}, options);
   ASSERT_OK(db_->GetDbSessionId(sid1));
   ASSERT_OK(Put("bar", "e1"));
@@ -179,6 +180,7 @@ TEST_F(DBBasicTest, UniqueSession) {
 TEST_F(DBBasicTest, ReadOnlyDB) {
   ASSERT_OK(Put("foo", "v1"));
   ASSERT_OK(Put("bar", "v2"));
+  ASSERT_OK(Flush());
   ASSERT_OK(Put("foo", "v3"));
   Close();
 
@@ -208,10 +210,11 @@ TEST_F(DBBasicTest, ReadOnlyDB) {
 
   auto options = CurrentOptions();
   assert(options.env == env_);
-  ASSERT_OK(ReadOnlyReopen(options));
+  ASSERT_OK(EnforcedReadOnlyReopen(options));
   ASSERT_EQ("v3", Get("foo"));
   ASSERT_EQ("v2", Get("bar"));
   verify_all_iters();
+  ASSERT_EQ(Flush().code(), Status::Code::kNotSupported);
   Close();
 
   // Reopen and flush memtable.
@@ -219,26 +222,38 @@ TEST_F(DBBasicTest, ReadOnlyDB) {
   ASSERT_OK(Flush());
   Close();
   // Now check keys in read only mode.
-  ASSERT_OK(ReadOnlyReopen(options));
+  ASSERT_OK(EnforcedReadOnlyReopen(options));
   ASSERT_EQ("v3", Get("foo"));
   ASSERT_EQ("v2", Get("bar"));
   verify_all_iters();
-  ASSERT_TRUE(db_->SyncWAL().IsNotSupported());
+  ASSERT_EQ(db_->SyncWAL().code(), Status::Code::kNotSupported);
+
+  // More ops that should fail
+  std::vector<ColumnFamilyHandle*> cfhs{{}};
+  ASSERT_EQ(db_->CreateColumnFamily(options, "blah", &cfhs[0]).code(),
+            Status::Code::kNotSupported);
+
+  ASSERT_EQ(db_->CreateColumnFamilies(options, {"blah"}, &cfhs).code(),
+            Status::Code::kNotSupported);
+
+  std::vector<ColumnFamilyDescriptor> cfds;
+  cfds.push_back({"blah", options});
+  ASSERT_EQ(db_->CreateColumnFamilies(cfds, &cfhs).code(),
+            Status::Code::kNotSupported);
 }
 
-// TODO akanksha: Update the test to check that combination
-// does not actually write to FS (use open read-only with
-// CompositeEnvWrapper+ReadOnlyFileSystem).
-TEST_F(DBBasicTest, DISABLED_ReadOnlyDBWithWriteDBIdToManifestSet) {
+TEST_F(DBBasicTest, ReadOnlyDBWithWriteDBIdToManifestSet) {
+  auto options = CurrentOptions();
+  options.write_dbid_to_manifest = false;
+  DestroyAndReopen(options);
   ASSERT_OK(Put("foo", "v1"));
   ASSERT_OK(Put("bar", "v2"));
   ASSERT_OK(Put("foo", "v3"));
   Close();
 
-  auto options = CurrentOptions();
   options.write_dbid_to_manifest = true;
   assert(options.env == env_);
-  ASSERT_OK(ReadOnlyReopen(options));
+  ASSERT_OK(EnforcedReadOnlyReopen(options));
   std::string db_id1;
   ASSERT_OK(db_->GetDbIdentity(db_id1));
   ASSERT_EQ("v3", Get("foo"));
@@ -258,7 +273,7 @@ TEST_F(DBBasicTest, DISABLED_ReadOnlyDBWithWriteDBIdToManifestSet) {
   ASSERT_OK(Flush());
   Close();
   // Now check keys in read only mode.
-  ASSERT_OK(ReadOnlyReopen(options));
+  ASSERT_OK(EnforcedReadOnlyReopen(options));
   ASSERT_EQ("v3", Get("foo"));
   ASSERT_EQ("v2", Get("bar"));
   ASSERT_TRUE(db_->SyncWAL().IsNotSupported());
@@ -3273,8 +3288,7 @@ TEST_F(DBBasicTest, GetAllKeyVersions) {
     ASSERT_OK(Delete(std::to_string(i)));
   }
   std::vector<KeyVersion> key_versions;
-  ASSERT_OK(GetAllKeyVersions(db_, Slice(), Slice(),
-                              std::numeric_limits<size_t>::max(),
+  ASSERT_OK(GetAllKeyVersions(db_, {}, {}, std::numeric_limits<size_t>::max(),
                               &key_versions));
   ASSERT_EQ(kNumInserts + kNumDeletes + kNumUpdates, key_versions.size());
   for (size_t i = 0; i < kNumInserts + kNumDeletes + kNumUpdates; i++) {
@@ -3284,7 +3298,7 @@ TEST_F(DBBasicTest, GetAllKeyVersions) {
       ASSERT_EQ(key_versions[i].GetTypeName(), "TypeValue");
     }
   }
-  ASSERT_OK(GetAllKeyVersions(db_, handles_[0], Slice(), Slice(),
+  ASSERT_OK(GetAllKeyVersions(db_, handles_[0], {}, {},
                               std::numeric_limits<size_t>::max(),
                               &key_versions));
   ASSERT_EQ(kNumInserts + kNumDeletes + kNumUpdates, key_versions.size());
@@ -3299,10 +3313,17 @@ TEST_F(DBBasicTest, GetAllKeyVersions) {
   for (size_t i = 0; i + 1 != kNumDeletes; ++i) {
     ASSERT_OK(Delete(1, std::to_string(i)));
   }
-  ASSERT_OK(GetAllKeyVersions(db_, handles_[1], Slice(), Slice(),
+  ASSERT_OK(GetAllKeyVersions(db_, handles_[1], {}, {},
                               std::numeric_limits<size_t>::max(),
                               &key_versions));
   ASSERT_EQ(kNumInserts + kNumDeletes + kNumUpdates - 3, key_versions.size());
+
+  // Change from historical behavior: empty key is now interpreted literally as
+  // a legal key (rather than as a "not present" key)
+  ASSERT_OK(GetAllKeyVersions(db_, handles_[1], Slice(), Slice(),
+                              std::numeric_limits<size_t>::max(),
+                              &key_versions));
+  ASSERT_EQ(key_versions.size(), 0);
 }
 
 TEST_F(DBBasicTest, ValueTypeString) {
@@ -5065,6 +5086,8 @@ TEST_F(DBBasicTest, DisallowMemtableWrite) {
   options_allow.create_if_missing = true;
   Options options_disallow = options_allow;
   options_disallow.disallow_memtable_writes = true;
+  options_disallow.paranoid_memory_checks = true;
+  options_disallow.memtable_veirfy_per_key_checksum_on_seek = true;
 
   DestroyAndReopen(options_allow);
   // CFs allowing and disallowing memtable write
@@ -5104,6 +5127,11 @@ TEST_F(DBBasicTest, DisallowMemtableWrite) {
   EXPECT_EQ(Get(2, "b2"), "2");
   EXPECT_EQ(Get(3, "b3"), "NOT_FOUND");
 
+  std::unique_ptr<Iterator> iter(
+      dbfull()->NewIterator(ReadOptions(), handles_[3]));
+  iter->Seek("a3");
+  ASSERT_OK(iter->status());
+  iter.reset();
   // When the DB is re-opened with WAL entries for a CF that is newly setting
   // disallow_memtable_writes, we detect that and fail the open gracefully.
   ASSERT_EQ(TryReopenWithColumnFamilies(

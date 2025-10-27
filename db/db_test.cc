@@ -59,11 +59,13 @@
 #include "rocksdb/utilities/checkpoint.h"
 #include "rocksdb/utilities/optimistic_transaction_db.h"
 #include "rocksdb/utilities/write_batch_with_index.h"
+#include "table/block_based/block_based_table_factory.h"
 #include "table/mock_table.h"
 #include "test_util/sync_point.h"
 #include "test_util/testharness.h"
 #include "test_util/testutil.h"
 #include "util/compression.h"
+#include "util/defer.h"
 #include "util/mutexlock.h"
 #include "util/random.h"
 #include "util/rate_limiter_impl.h"
@@ -140,6 +142,121 @@ TEST_F(DBTest, MockEnvTest) {
   }
 
   delete db;
+}
+
+TEST_F(DBTest, RequestIdPlumbingTest) {
+  // test that request_id is passed to the filesystem, from
+  // ReadOptions to IODebugContext
+  Options options = CurrentOptions();
+  options.env = env_;
+
+  // Create a mock environment to capture IODebugContext during reads
+  IODebugContext dbgCopy;
+  const std::string* captured_request_id_dbg;
+
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
+      "RandomAccessFileReader::Read:IODebugContext", [&](void* arg) {
+        IODebugContext* dbg = static_cast<IODebugContext*>(arg);
+        if (dbg == nullptr) {
+          captured_request_id_dbg = nullptr;
+        } else {
+          captured_request_id_dbg = dbg->request_id;
+          // Test IODebugContext assignment operator
+          dbgCopy = *dbg;
+        }
+      });
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->EnableProcessing();
+
+  ASSERT_OK(Put("k1", "v1"));
+  ASSERT_OK(Flush());
+
+  // test request_id plumbing during a get
+  {
+    const std::string test_request_id = "test_request_id_123";
+    ReadOptions read_opts;
+    read_opts.request_id = &test_request_id;
+    std::string value;
+    ASSERT_OK(db_->Get(read_opts, "k1", &value));
+
+    // Verify the request_id was propagated to the file system
+    ASSERT_NE(captured_request_id_dbg, nullptr);
+    ASSERT_EQ(*captured_request_id_dbg, test_request_id);
+
+    ASSERT_NE(dbgCopy.request_id, nullptr);
+    ASSERT_NE(dbgCopy.request_id, captured_request_id_dbg);
+    ASSERT_EQ(*dbgCopy.request_id, test_request_id);
+  }
+
+  captured_request_id_dbg = nullptr;
+
+  // test request_id plumbing during iterator seek
+  ASSERT_OK(Put("k2", "v2"));
+  ASSERT_OK(Flush());
+  {
+    ReadOptions read_opts;
+    const std::string request_id = "test_request_id_456";
+    read_opts.request_id = &request_id;
+
+    std::unique_ptr<Iterator> iter(db_->NewIterator(read_opts));
+    iter->Seek("k2");
+    ASSERT_TRUE(iter->Valid());
+
+    // Verify the request_id was propagated to the file system
+    ASSERT_NE(captured_request_id_dbg, nullptr);
+    ASSERT_EQ(*captured_request_id_dbg, request_id);
+
+    ASSERT_NE(dbgCopy.request_id, nullptr);
+    ASSERT_NE(dbgCopy.request_id, captured_request_id_dbg);
+    ASSERT_EQ(*dbgCopy.request_id, request_id);
+
+    // Test IODebugContext copy constructor
+    IODebugContext dbgCopy2(dbgCopy);
+    ASSERT_NE(dbgCopy2.request_id, nullptr);
+    ASSERT_NE(dbgCopy2.request_id, captured_request_id_dbg);
+    ASSERT_NE(dbgCopy2.request_id, dbgCopy.request_id);
+    ASSERT_EQ(*dbgCopy2.request_id, request_id);
+  }
+
+  // test request_id plumbing during multiget
+  captured_request_id_dbg = nullptr;
+
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->ClearAllCallBacks();
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
+      "RandomAccessFileReader::MultiRead:IODebugContext", [&](void* arg) {
+        IODebugContext* dbg = static_cast<IODebugContext*>(arg);
+        if (dbg == nullptr) {
+          captured_request_id_dbg = nullptr;
+        } else {
+          captured_request_id_dbg = dbg->request_id;
+        }
+      });
+
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->EnableProcessing();
+
+  ASSERT_OK(Put("k3", "v3"));
+  ASSERT_OK(Put("k4", "v4"));
+  ASSERT_OK(Flush());
+
+  {
+    ReadOptions read_opts;
+    const std::string multiget_request_id = "test_request_id_789";
+    read_opts.request_id = &multiget_request_id;
+
+    std::vector<std::string> values;
+    std::vector<Slice> keys = {Slice("k3"), Slice("k4")};
+
+    values.resize(keys.size());
+
+    std::vector<ColumnFamilyHandle*> cfhs(keys.size(),
+                                          db_->DefaultColumnFamily());
+    db_->MultiGet(read_opts, cfhs, keys, &values);
+
+    ASSERT_NE(captured_request_id_dbg, nullptr);
+    ASSERT_EQ(*captured_request_id_dbg, multiget_request_id);
+  }
+
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->DisableProcessing();
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->ClearAllCallBacks();
 }
 
 TEST_F(DBTest, MemEnvTest) {
@@ -1160,12 +1277,6 @@ class DelayFilterFactory : public CompactionFilterFactory {
   DBTestBase* db_test;
 };
 }  // anonymous namespace
-
-static std::string CompressibleString(Random* rnd, int len) {
-  std::string r;
-  test::CompressibleString(rnd, 0.8, len, &r);
-  return r;
-}
 
 TEST_F(DBTest, FailMoreDbPaths) {
   Options options = CurrentOptions();
@@ -3180,6 +3291,15 @@ class ModelDB : public DB {
     return Status();
   }
 
+  using DB::GetPropertiesOfTablesByLevel;
+  Status GetPropertiesOfTablesByLevel(
+      ColumnFamilyHandle* /* column_family */,
+      std::vector<
+          std::unique_ptr<TablePropertiesCollection>>* /* props_by_level */)
+      override {
+    return Status();
+  }
+
   using DB::KeyMayExist;
   bool KeyMayExist(const ReadOptions& /*options*/,
                    ColumnFamilyHandle* /*column_family*/, const Slice& /*key*/,
@@ -3340,11 +3460,6 @@ class ModelDB : public DB {
   using DB::NumberLevels;
   int NumberLevels(ColumnFamilyHandle* /*column_family*/) override { return 1; }
 
-  using DB::MaxMemCompactionLevel;
-  int MaxMemCompactionLevel(ColumnFamilyHandle* /*column_family*/) override {
-    return 1;
-  }
-
   using DB::Level0StopWriteTrigger;
   int Level0StopWriteTrigger(ColumnFamilyHandle* /*column_family*/) override {
     return -1;
@@ -3401,7 +3516,7 @@ class ModelDB : public DB {
   }
 
   Status GetCurrentWalFile(
-      std::unique_ptr<LogFile>* /*current_log_file*/) override {
+      std::unique_ptr<LogFile>* /*current_wal_file*/) override {
     return Status::OK();
   }
 
@@ -3437,6 +3552,11 @@ class ModelDB : public DB {
 
   Status GetFullHistoryTsLow(ColumnFamilyHandle* /*cf*/,
                              std::string* /*ts_low*/) override {
+    return Status::OK();
+  }
+
+  Status GetNewestUserDefinedTimestamp(
+      ColumnFamilyHandle* /*cf*/, std::string* /*newest_timestamp*/) override {
     return Status::OK();
   }
 
@@ -5281,272 +5401,6 @@ TEST_F(DBTest, FlushOnDestroy) {
   CancelAllBackgroundWork(db_);
 }
 
-TEST_F(DBTest, DynamicLevelCompressionPerLevel) {
-  if (!Snappy_Supported()) {
-    return;
-  }
-  const int kNKeys = 120;
-  int keys[kNKeys];
-  for (int i = 0; i < kNKeys; i++) {
-    keys[i] = i;
-  }
-
-  Random rnd(301);
-  Options options;
-  options.env = env_;
-  options.create_if_missing = true;
-  options.db_write_buffer_size = 20480;
-  options.write_buffer_size = 20480;
-  options.max_write_buffer_number = 2;
-  options.level0_file_num_compaction_trigger = 2;
-  options.level0_slowdown_writes_trigger = 2;
-  options.level0_stop_writes_trigger = 2;
-  options.target_file_size_base = 20480;
-  options.level_compaction_dynamic_level_bytes = true;
-  options.max_bytes_for_level_base = 102400;
-  options.max_bytes_for_level_multiplier = 4;
-  options.max_background_compactions = 1;
-  options.num_levels = 5;
-  options.statistics = CreateDBStatistics();
-
-  options.compression_per_level.resize(3);
-  // No compression for L0
-  options.compression_per_level[0] = kNoCompression;
-  // No compression for the Ln whre L0 is compacted to
-  options.compression_per_level[1] = kNoCompression;
-  // Snappy compression for Ln+1
-  options.compression_per_level[2] = kSnappyCompression;
-
-  OnFileDeletionListener* listener = new OnFileDeletionListener();
-  options.listeners.emplace_back(listener);
-
-  DestroyAndReopen(options);
-
-  // Insert more than 80K. L4 should be base level. Neither L0 nor L4 should
-  // be compressed, so there shouldn't be any compression.
-  for (int i = 0; i < 20; i++) {
-    ASSERT_OK(Put(Key(keys[i]), CompressibleString(&rnd, 4000)));
-    ASSERT_OK(dbfull()->TEST_WaitForBackgroundWork());
-  }
-  ASSERT_OK(Flush());
-  ASSERT_OK(dbfull()->TEST_WaitForCompact());
-
-  ASSERT_EQ(NumTableFilesAtLevel(1), 0);
-  ASSERT_EQ(NumTableFilesAtLevel(2), 0);
-  ASSERT_EQ(NumTableFilesAtLevel(3), 0);
-  ASSERT_TRUE(NumTableFilesAtLevel(0) > 0 || NumTableFilesAtLevel(4) > 0);
-
-  // Verify there was no compression
-  auto num_block_compressed =
-      options.statistics->getTickerCount(NUMBER_BLOCK_COMPRESSED);
-  ASSERT_EQ(num_block_compressed, 0);
-
-  // Insert 400KB and there will be some files end up in L3. According to the
-  // above compression settings for each level, there will be some compression.
-  ASSERT_OK(options.statistics->Reset());
-  ASSERT_EQ(num_block_compressed, 0);
-  for (int i = 20; i < 120; i++) {
-    ASSERT_OK(Put(Key(keys[i]), CompressibleString(&rnd, 4000)));
-    ASSERT_OK(dbfull()->TEST_WaitForBackgroundWork());
-  }
-  ASSERT_OK(Flush());
-  ASSERT_OK(dbfull()->TEST_WaitForCompact());
-  ASSERT_EQ(NumTableFilesAtLevel(1), 0);
-  ASSERT_EQ(NumTableFilesAtLevel(2), 0);
-  ASSERT_GE(NumTableFilesAtLevel(3), 1);
-  ASSERT_GE(NumTableFilesAtLevel(4), 1);
-
-  // Verify there was compression
-  num_block_compressed =
-      options.statistics->getTickerCount(NUMBER_BLOCK_COMPRESSED);
-  ASSERT_GT(num_block_compressed, 0);
-
-  // Make sure data in files in L3 is not compacted by removing all files
-  // in L4 and calculate number of rows
-  ASSERT_OK(dbfull()->SetOptions({
-      {"disable_auto_compactions", "true"},
-  }));
-  ColumnFamilyMetaData cf_meta;
-  db_->GetColumnFamilyMetaData(&cf_meta);
-
-  // Ensure that L1+ files are non-overlapping and together with L0 encompass
-  // full key range between smallestkey and largestkey from CF file metadata.
-  int largestkey_in_prev_level = -1;
-  int keys_found = 0;
-  for (int level = (int)cf_meta.levels.size() - 1; level >= 0; level--) {
-    int files_in_level = (int)cf_meta.levels[level].files.size();
-    int largestkey_in_prev_file = -1;
-    for (int j = 0; j < files_in_level; j++) {
-      int smallestkey = IdFromKey(cf_meta.levels[level].files[j].smallestkey);
-      int largestkey = IdFromKey(cf_meta.levels[level].files[j].largestkey);
-      int num_entries = (int)cf_meta.levels[level].files[j].num_entries;
-      ASSERT_EQ(num_entries, largestkey - smallestkey + 1);
-      keys_found += num_entries;
-      if (level > 0) {
-        if (j == 0) {
-          ASSERT_GT(smallestkey, largestkey_in_prev_level);
-        }
-        if (j > 0) {
-          ASSERT_GT(smallestkey, largestkey_in_prev_file);
-        }
-        if (j == files_in_level - 1) {
-          largestkey_in_prev_level = largestkey;
-        }
-      }
-      largestkey_in_prev_file = largestkey;
-    }
-  }
-  ASSERT_EQ(keys_found, kNKeys);
-
-  for (const auto& file : cf_meta.levels[4].files) {
-    listener->SetExpectedFileName(dbname_ + file.name);
-    Slice start(file.smallestkey), limit(file.largestkey);
-    const RangePtr ranges(&start, &limit);
-    // Given verification from above, we're guaranteed that by deleting all the
-    // files in [<smallestkey>, <largestkey>] range, we're effectively deleting
-    // that very single file and nothing more.
-    EXPECT_OK(dbfull()->DeleteFilesInRanges(dbfull()->DefaultColumnFamily(),
-                                            &ranges, true /* include_end */));
-  }
-  listener->VerifyMatchedCount(cf_meta.levels[4].files.size());
-
-  int num_keys = 0;
-  std::unique_ptr<Iterator> iter(db_->NewIterator(ReadOptions()));
-  for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
-    num_keys++;
-  }
-  ASSERT_OK(iter->status());
-
-  ASSERT_EQ(NumTableFilesAtLevel(1), 0);
-  ASSERT_EQ(NumTableFilesAtLevel(2), 0);
-  ASSERT_GE(NumTableFilesAtLevel(3), 1);
-  ASSERT_EQ(NumTableFilesAtLevel(4), 0);
-
-  ASSERT_GT(SizeAtLevel(0) + SizeAtLevel(3), num_keys * 4000U + num_keys * 10U);
-}
-
-TEST_F(DBTest, DynamicLevelCompressionPerLevel2) {
-  if (!Snappy_Supported() || !LZ4_Supported() || !Zlib_Supported()) {
-    return;
-  }
-  const int kNKeys = 500;
-  int keys[kNKeys];
-  for (int i = 0; i < kNKeys; i++) {
-    keys[i] = i;
-  }
-  RandomShuffle(std::begin(keys), std::end(keys));
-
-  Random rnd(301);
-  Options options;
-  options.create_if_missing = true;
-  options.db_write_buffer_size = 6000000;
-  options.write_buffer_size = 600000;
-  options.max_write_buffer_number = 2;
-  options.level0_file_num_compaction_trigger = 2;
-  options.level0_slowdown_writes_trigger = 2;
-  options.level0_stop_writes_trigger = 2;
-  options.soft_pending_compaction_bytes_limit = 1024 * 1024;
-  options.target_file_size_base = 20;
-  options.env = env_;
-  options.level_compaction_dynamic_level_bytes = true;
-  options.max_bytes_for_level_base = 200;
-  options.max_bytes_for_level_multiplier = 8;
-  options.max_background_compactions = 1;
-  options.num_levels = 5;
-  std::shared_ptr<mock::MockTableFactory> mtf(new mock::MockTableFactory);
-  options.table_factory = mtf;
-
-  options.compression_per_level.resize(3);
-  options.compression_per_level[0] = kNoCompression;
-  options.compression_per_level[1] = kLZ4Compression;
-  options.compression_per_level[2] = kZlibCompression;
-
-  DestroyAndReopen(options);
-  // When base level is L4, L4 is LZ4.
-  std::atomic<int> num_zlib(0);
-  std::atomic<int> num_lz4(0);
-  std::atomic<int> num_no(0);
-  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
-      "LevelCompactionPicker::PickCompaction:Return", [&](void* arg) {
-        Compaction* compaction = static_cast<Compaction*>(arg);
-        if (compaction->output_level() == 4) {
-          ASSERT_TRUE(compaction->output_compression() == kLZ4Compression);
-          num_lz4.fetch_add(1);
-        }
-      });
-  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
-      "FlushJob::WriteLevel0Table:output_compression", [&](void* arg) {
-        auto* compression = static_cast<CompressionType*>(arg);
-        ASSERT_TRUE(*compression == kNoCompression);
-        num_no.fetch_add(1);
-      });
-  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->EnableProcessing();
-
-  for (int i = 0; i < 100; i++) {
-    std::string value = rnd.RandomString(200);
-    ASSERT_OK(Put(Key(keys[i]), value));
-    if (i % 25 == 24) {
-      ASSERT_OK(Flush());
-      ASSERT_OK(dbfull()->TEST_WaitForCompact());
-    }
-  }
-
-  ASSERT_OK(Flush());
-  ASSERT_OK(dbfull()->TEST_WaitForFlushMemTable());
-  ASSERT_OK(dbfull()->TEST_WaitForCompact());
-  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->DisableProcessing();
-  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->ClearAllCallBacks();
-
-  ASSERT_EQ(NumTableFilesAtLevel(1), 0);
-  ASSERT_EQ(NumTableFilesAtLevel(2), 0);
-  ASSERT_EQ(NumTableFilesAtLevel(3), 0);
-  ASSERT_GT(NumTableFilesAtLevel(4), 0);
-  ASSERT_GT(num_no.load(), 2);
-  ASSERT_GT(num_lz4.load(), 0);
-  int prev_num_files_l4 = NumTableFilesAtLevel(4);
-
-  // After base level turn L4->L3, L3 becomes LZ4 and L4 becomes Zlib
-  num_lz4.store(0);
-  num_no.store(0);
-  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
-      "LevelCompactionPicker::PickCompaction:Return", [&](void* arg) {
-        Compaction* compaction = static_cast<Compaction*>(arg);
-        if (compaction->output_level() == 4 && compaction->start_level() == 3) {
-          ASSERT_TRUE(compaction->output_compression() == kZlibCompression);
-          num_zlib.fetch_add(1);
-        } else {
-          ASSERT_TRUE(compaction->output_compression() == kLZ4Compression);
-          num_lz4.fetch_add(1);
-        }
-      });
-  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
-      "FlushJob::WriteLevel0Table:output_compression", [&](void* arg) {
-        auto* compression = static_cast<CompressionType*>(arg);
-        ASSERT_TRUE(*compression == kNoCompression);
-        num_no.fetch_add(1);
-      });
-  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->EnableProcessing();
-
-  for (int i = 101; i < 500; i++) {
-    std::string value = rnd.RandomString(200);
-    ASSERT_OK(Put(Key(keys[i]), value));
-    if (i % 100 == 99) {
-      ASSERT_OK(Flush());
-      ASSERT_OK(dbfull()->TEST_WaitForCompact());
-    }
-  }
-
-  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->ClearAllCallBacks();
-  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->DisableProcessing();
-  ASSERT_EQ(NumTableFilesAtLevel(1), 0);
-  ASSERT_EQ(NumTableFilesAtLevel(2), 0);
-  ASSERT_GT(NumTableFilesAtLevel(3), 0);
-  ASSERT_GT(NumTableFilesAtLevel(4), prev_num_files_l4);
-  ASSERT_GT(num_no.load(), 2);
-  ASSERT_GT(num_lz4.load(), 0);
-  ASSERT_GT(num_zlib.load(), 0);
-}
-
 TEST_F(DBTest, DynamicCompactionOptions) {
   // minimum write buffer size is enforced at 64KB
   const uint64_t k32KB = 1 << 15;
@@ -6084,6 +5938,11 @@ TEST_F(DBTest, L0L1L2AndUpHitCounter) {
 }
 
 TEST_F(DBTest, EncodeDecompressedBlockSizeTest) {
+  // Allow testing format_version=1
+  bool& allow_unsupported_fv = TEST_AllowUnsupportedFormatVersion();
+  SaveAndRestore guard(&allow_unsupported_fv);
+  ASSERT_FALSE(allow_unsupported_fv);
+
   // iter 0 -- zlib
   // iter 1 -- bzip2
   // iter 2 -- lz4
@@ -6106,7 +5965,16 @@ TEST_F(DBTest, EncodeDecompressedBlockSizeTest) {
       table_options.format_version = first_table_version;
       table_options.filter_policy.reset(NewBloomFilterPolicy(10));
       Options options = CurrentOptions();
+
+      // Hack to generate old files (checked in factory construction)
+      allow_unsupported_fv = true;
       options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+      ASSERT_EQ(options.table_factory->GetOptions<BlockBasedTableOptions>()
+                    ->format_version,
+                first_table_version);
+      // Able to read old files without the hack
+      allow_unsupported_fv = false;
+
       options.create_if_missing = true;
       options.compression = comp;
       DestroyAndReopen(options);
@@ -6118,9 +5986,14 @@ TEST_F(DBTest, EncodeDecompressedBlockSizeTest) {
         // compressible string
         ASSERT_OK(Put(Key(i), rnd.RandomString(128) + std::string(128, 'a')));
       }
+      ASSERT_OK(Flush());
 
       table_options.format_version = first_table_version == 1 ? 2 : 1;
       options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+      // format_version (for writing) is sanitized to minimum supported
+      ASSERT_EQ(options.table_factory->GetOptions<BlockBasedTableOptions>()
+                    ->format_version,
+                BlockBasedTableFactory::kMinSupportedFormatVersion);
       Reopen(options);
       for (int i = 0; i < kNumKeysWritten; ++i) {
         auto r = Get(Key(i));
@@ -6389,7 +6262,7 @@ TEST_F(DBTest, TestLogCleanup) {
 
   for (int i = 0; i < 100000; ++i) {
     ASSERT_OK(Put(Key(i), "val"));
-    // only 2 memtables will be alive, so logs_to_free needs to always be below
+    // only 2 memtables will be alive, so wals_to_free needs to always be below
     // 2
     ASSERT_LT(dbfull()->TEST_LogsToFreeSize(), static_cast<size_t>(3));
   }
@@ -7204,27 +7077,6 @@ TEST_F(DBTest, LastWriteBufferDelay) {
   sleeping_task.WaitUntilDone();
 }
 #endif  // !defined(ROCKSDB_DISABLE_STALL_NOTIFICATION)
-
-TEST_F(DBTest, FailWhenCompressionNotSupportedTest) {
-  CompressionType compressions[] = {kZlibCompression, kBZip2Compression,
-                                    kLZ4Compression, kLZ4HCCompression,
-                                    kXpressCompression};
-  for (auto comp : compressions) {
-    if (!CompressionTypeSupported(comp)) {
-      // not supported, we should fail the Open()
-      Options options = CurrentOptions();
-      options.compression = comp;
-      ASSERT_TRUE(!TryReopen(options).ok());
-      // Try if CreateColumnFamily also fails
-      options.compression = kNoCompression;
-      ASSERT_OK(TryReopen(options));
-      ColumnFamilyOptions cf_options(options);
-      cf_options.compression = comp;
-      ColumnFamilyHandle* handle;
-      ASSERT_TRUE(!db_->CreateColumnFamily(cf_options, "name", &handle).ok());
-    }
-  }
-}
 
 TEST_F(DBTest, CreateColumnFamilyShouldFailOnIncompatibleOptions) {
   Options options = CurrentOptions();

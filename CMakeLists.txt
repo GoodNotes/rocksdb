@@ -27,7 +27,7 @@
 #
 # Linux:
 #
-# 1. Install a recent toolchain if you're on a older distro. C++17 required (GCC >= 7, Clang >= 5)
+# 1. Install a recent toolchain if you're on a older distro. C++20 required (GCC >= 11, Clang >= 10)
 # 2. mkdir build; cd build
 # 3. cmake ..
 # 4. make -j
@@ -100,7 +100,7 @@ endif()
 option(ROCKSDB_BUILD_SHARED "Build shared versions of the RocksDB libraries" ON)
 
 if( NOT DEFINED CMAKE_CXX_STANDARD )
-  set(CMAKE_CXX_STANDARD 17)
+  set(CMAKE_CXX_STANDARD 20)
 endif()
 
 include(CMakeDependentOption)
@@ -203,9 +203,16 @@ if(WIN32 AND MSVC)
   endif()
 endif()
 
+option(WIN_CI "Accelerate build speed and reduce build artifect size for github CI with MSVC" OFF)
+
 if(MSVC)
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /Zi /nologo /EHsc /GS /Gd /GR /GF /fp:precise /Zc:wchar_t /Zc:forScope /errorReport:queue")
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /FC /d2Zi+ /W4 /wd4127 /wd4996 /wd4100 /wd4324")
+  if(WIN_CI)
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /MP /nologo /EHsc /Gd /GR /GF /fp:precise /Zc:wchar_t /Zc:forScope /errorReport:queue")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /FC /W4 /wd4127 /wd4996 /wd4100 /wd4324 /wd4702")
+  else()
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /Zi /nologo /EHsc /GS /Gd /GR /GF /fp:precise /Zc:wchar_t /Zc:forScope /errorReport:queue")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /FC /d2Zi+ /W4 /wd4127 /wd4996 /wd4100 /wd4324")
+  endif()
 else()
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -W -Wextra -Wall -pthread")
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wsign-compare -Wshadow -Wno-unused-parameter -Wno-unused-variable -Woverloaded-virtual -Wnon-virtual-dtor -Wno-missing-field-initializers -Wno-strict-aliasing -Wno-invalid-offsetof")
@@ -313,8 +320,7 @@ if(NOT MSVC)
 endif()
 
 # Check if -latomic is required or not
-if (NOT MSVC)
-  set(CMAKE_REQUIRED_FLAGS "--std=c++17")
+if (NOT MSVC AND NOT APPLE)
   CHECK_CXX_SOURCE_COMPILES("
 #include <atomic>
 std::atomic<uint64_t> x(0);
@@ -451,24 +457,33 @@ else()
   endif()
 endif()
 
-# Used to run CI build and tests so we can run faster
+# Used to run optimized debug build and tests so we can run faster
 option(OPTDBG "Build optimized debug build with MSVC" OFF)
 option(WITH_RUNTIME_DEBUG "build with debug version of runtime library" ON)
 if(MSVC)
-  if(OPTDBG)
+  if (WIN_CI)
     message(STATUS "Debug optimization is enabled")
     set(CMAKE_CXX_FLAGS_DEBUG "/Oxt")
+    set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} /DEBUG:FASTLINK")
+    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} /DEBUG:FASTLINK")
   else()
-    set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} /Od /RTC1")
-
-    # Minimal Build is deprecated after MSVC 2015
-    if( MSVC_VERSION GREATER 1900 )
-      set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} /Gm-")
+    if(OPTDBG)
+      message(STATUS "Debug optimization is enabled")
+      set(CMAKE_CXX_FLAGS_DEBUG "/Oxt")
     else()
-      set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} /Gm")
-    endif()
+      set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} /Od /RTC1")
 
+      # Minimal Build is deprecated after MSVC 2015
+      if( MSVC_VERSION GREATER 1900 )
+        set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} /Gm-")
+      else()
+        set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} /Gm")
+      endif()
+    endif()
+    set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} /DEBUG")
+    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} /DEBUG")
   endif()
+
   if(WITH_RUNTIME_DEBUG)
     set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} /${RUNTIME_LIBRARY}d")
   else()
@@ -476,8 +491,6 @@ if(MSVC)
   endif()
   set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} /Oxt /Zp8 /Gm- /Gy /${RUNTIME_LIBRARY}")
 
-  set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} /DEBUG")
-  set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} /DEBUG")
 endif()
 
 if(CMAKE_COMPILER_IS_GNUCXX)
@@ -721,6 +734,7 @@ set(SOURCES
         db/memtable_list.cc
         db/merge_helper.cc
         db/merge_operator.cc
+        db/multi_scan.cc
         db/output_validator.cc
         db/periodic_task_scheduler.cc
         db/range_del_aggregator.cc
@@ -746,6 +760,7 @@ set(SOURCES
         db/write_controller.cc
         db/write_stall_stats.cc
         db/write_thread.cc
+        db_stress_tool/db_stress_compression_manager.cc
         env/composite_env.cc
         env/env.cc
         env/env_chroot.cc
@@ -835,7 +850,7 @@ set(SOURCES
         table/cuckoo/cuckoo_table_builder.cc
         table/cuckoo/cuckoo_table_factory.cc
         table/cuckoo/cuckoo_table_reader.cc
-        table/external_table_reader.cc
+        table/external_table.cc
         table/format.cc
         table/get_context.cc
         table/iterator.cc
@@ -874,11 +889,13 @@ set(SOURCES
         trace_replay/trace_record.cc
         trace_replay/trace_replay.cc
         util/async_file_reader.cc
+        util/auto_tune_compressor.cc
         util/cleanable.cc
         util/coding.cc
         util/compaction_job_stats_impl.cc
         util/comparator.cc
         util/compression.cc
+        util/simple_mixed_compressor.cc
         util/compression_context_cache.cc
         util/concurrent_task_limiter_impl.cc
         util/crc32c.cc
@@ -1435,6 +1452,7 @@ if(WITH_TESTS)
         table/block_based/block_based_table_reader_test.cc
         table/block_based/block_test.cc
         table/block_based/data_block_hash_index_test.cc
+        table/block_based/index_builder_test.cc
         table/block_based/full_filter_block_test.cc
         table/block_based/partitioned_filter_block_test.cc
         table/cleanable_test.cc
@@ -1456,6 +1474,7 @@ if(WITH_TESTS)
         util/autovector_test.cc
         util/bloom_test.cc
         util/coding_test.cc
+        util/compression_test.cc
         util/crc32c_test.cc
         util/defer_test.cc
         util/dynamic_bloom_test.cc
@@ -1499,6 +1518,7 @@ if(WITH_TESTS)
         utilities/transactions/optimistic_transaction_test.cc
         utilities/transactions/transaction_test.cc
         utilities/transactions/lock/point/point_lock_manager_test.cc
+        utilities/transactions/lock/point/point_lock_manager_stress_test.cc
         utilities/transactions/write_committed_transaction_ts_test.cc
         utilities/transactions/write_prepared_transaction_test.cc
         utilities/transactions/write_unprepared_transaction_test.cc
@@ -1608,6 +1628,12 @@ if(WITH_BENCHMARK_TOOLS)
   add_executable(hash_table_bench${ARTIFACT_SUFFIX}
     utilities/persistent_cache/hash_table_bench.cc)
   target_link_libraries(hash_table_bench${ARTIFACT_SUFFIX}
+    ${ROCKSDB_LIB} ${GFLAGS_LIB} ${FOLLY_LIBS})
+
+  add_executable(point_lock_bench${ARTIFACT_SUFFIX}
+    utilities/transactions/lock/point/point_lock_bench.cc
+    utilities/transactions/lock/point/point_lock_bench_tool.cc)
+  target_link_libraries(point_lock_bench${ARTIFACT_SUFFIX}
     ${ROCKSDB_LIB} ${GFLAGS_LIB} ${FOLLY_LIBS})
 endif()
 

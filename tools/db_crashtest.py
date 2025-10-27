@@ -11,6 +11,56 @@ import sys
 import tempfile
 import time
 
+per_iteration_random_seed_override = 0
+remain_argv = None
+
+
+def get_random_seed(override):
+    if override == 0:
+        return random.randint(1, 2**64)
+    else:
+        return override
+
+
+def setup_random_seed_before_main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--initial_random_seed_override",
+        default=0,
+        type=int,
+        help="Random seed used for initialize the test parameters at the beginning of stress test run",
+    )
+    # sometimes the failure appeared after a few iteration, to reproduce the error, we have to wait for the test to run
+    # multiple iterations to reach the iteration that fails the test. By overriding the seed used within each iteration,
+    # we could skip all the previous iterations.
+    parser.add_argument(
+        "--per_iteration_random_seed_override",
+        default=0,
+        type=int,
+        help="Random seed used for initialize the test parameters in each iteration of the stress test run",
+    )
+
+    global remain_args
+    args, remain_args = parser.parse_known_args()
+    init_random_seed = get_random_seed(args.initial_random_seed_override)
+    global per_iteration_random_seed_override
+    per_iteration_random_seed_override = args.per_iteration_random_seed_override
+
+    print(f"Start with random seed {init_random_seed}")
+    random.seed(init_random_seed)
+
+
+def apply_random_seed_per_iteration():
+    global per_iteration_random_seed_override
+    per_iteration_random_seed = get_random_seed(per_iteration_random_seed_override)
+    print(f"Use random seed for iteration {per_iteration_random_seed}")
+    random.seed(per_iteration_random_seed)
+
+
+# Random seed has to be setup before the rest of the script, so that the random
+# value selected in the global variable uses the random seed specified
+setup_random_seed_before_main()
+
 # params overwrite priority:
 #   for default:
 #       default_params < {blackbox,whitebox}_default_params < args
@@ -61,7 +111,7 @@ default_params = {
     ),
     "compression_max_dict_bytes": lambda: 16384 * random.randint(0, 1),
     "compression_zstd_max_train_bytes": lambda: 65536 * random.randint(0, 1),
-    "compression_parallel_threads": lambda: random.choice([1] * 3 + [4, 8, 16]),
+    "compression_parallel_threads": lambda: random.choice([1, 1, 2, 3, 4, 5, 8, 9, 16]),
     "compression_max_dict_buffer_bytes": lambda: (1 << random.randint(0, 40)) - 1,
     "compression_use_zstd_dict_trainer": lambda: random.randint(0, 1),
     "compression_checksum": lambda: random.randint(0, 1),
@@ -80,6 +130,7 @@ default_params = {
     "destroy_db_initially": 0,
     "enable_pipelined_write": lambda: random.randint(0, 1),
     "enable_compaction_filter": lambda: random.choice([0, 0, 0, 1]),
+    "enable_compaction_on_deletion_trigger": lambda: random.choice([0, 0, 0, 1]),
     # `inplace_update_support` is incompatible with DB that has delete
     # range data in memtables.
     # Such data can result from any of the previous db stress runs
@@ -91,7 +142,6 @@ default_params = {
     # (see below `finalize_and_sanitize`).
     "inplace_update_support": random.choice([0] * 9 + [1]),
     "expected_values_dir": lambda: setup_expected_values_dir(),
-    "fail_if_options_file_error": lambda: random.randint(0, 1),
     "flush_one_in": lambda: random.choice([1000, 1000000]),
     "manual_wal_flush_one_in": lambda: random.choice([0, 1000]),
     "file_checksum_impl": lambda: random.choice(["none", "crc32c", "xxh64", "big"]),
@@ -108,13 +158,14 @@ default_params = {
     "iterpercent": 10,
     "lock_wal_one_in": lambda: random.choice([10000, 1000000]),
     "mark_for_compaction_one_file_in": lambda: 10 * random.randint(0, 1),
-    "max_background_compactions": 20,
+    "max_background_compactions": lambda: random.choice([2, 20]),
+    "num_bottom_pri_threads": lambda: random.choice([0, 1, 20]),
     "max_bytes_for_level_base": 10485760,
     # max_key has to be the same across invocations for verification to work, hence no lambda
     "max_key": random.choice([100000, 25000000]),
     "max_sequential_skip_in_iterations": lambda: random.choice([1, 2, 8, 16]),
     "max_write_buffer_number": 3,
-    "mmap_read": lambda: random.randint(0, 1),
+    "mmap_read": lambda: random.choice([0, 0, 1]),
     # Setting `nooverwritepercent > 0` is only possible because we do not vary
     # the random seed, so the same keys are chosen by every run for disallowing
     # overwrites.
@@ -178,7 +229,7 @@ default_params = {
     "verify_checksum": 1,
     "write_buffer_size": lambda: random.choice([1024 * 1024, 4 * 1024 * 1024]),
     "writepercent": 35,
-    "format_version": lambda: random.choice([2, 3, 4, 5, 6, 6]),
+    "format_version": lambda: random.choice([2, 3, 4, 5, 6, 7, 7]),
     "index_block_restart_interval": lambda: random.choice(range(1, 16)),
     "use_multiget": lambda: random.randint(0, 1),
     "use_get_entity": lambda: random.choice([0] * 7 + [1]),
@@ -322,17 +373,21 @@ default_params = {
     "enable_sst_partitioner_factory": lambda: random.choice([0, 1]),
     "enable_do_not_compress_roles": lambda: random.choice([0, 1]),
     "block_align": lambda: random.choice([0, 1]),
+    "super_block_alignment_size": lambda: random.choice(
+        [0, 128 * 1024, 512 * 1024, 2 * 1024 * 1024]
+    ),
+    "super_block_alignment_space_overhead_ratio": lambda: random.choice([0, 32, 4096]),
     "lowest_used_cache_tier": lambda: random.choice([0, 1, 2]),
     "enable_custom_split_merge": lambda: random.choice([0, 1]),
     "adm_policy": lambda: random.choice([0, 1, 2, 3]),
     "last_level_temperature": lambda: random.choice(
-        ["kUnknown", "kHot", "kWarm", "kCold"]
+        ["kUnknown", "kHot", "kWarm", "kCool", "kCold", "kIce"]
     ),
     "default_write_temperature": lambda: random.choice(
-        ["kUnknown", "kHot", "kWarm", "kCold"]
+        ["kUnknown", "kHot", "kWarm", "kCool", "kCold", "kIce"]
     ),
     "default_temperature": lambda: random.choice(
-        ["kUnknown", "kHot", "kWarm", "kCold"]
+        ["kUnknown", "kHot", "kWarm", "kCool", "kCold", "kIce"]
     ),
     # TODO(hx235): enable `enable_memtable_insert_with_hint_prefix_extractor`
     # after fixing the surfaced issue with delete range
@@ -342,13 +397,34 @@ default_params = {
     "use_timed_put_one_in": lambda: random.choice([0] * 7 + [1, 5, 10]),
     "universal_max_read_amp": lambda: random.choice([-1] * 3 + [0, 4, 10]),
     "paranoid_memory_checks": lambda: random.choice([0] * 7 + [1]),
+    "memtable_veirfy_per_key_checksum_on_seek": lambda: random.choice([0] * 7 + [1]),
     "allow_unprepared_value": lambda: random.choice([0, 1]),
-    # TODO(hx235): enable `track_and_verify_wals` again after resolving the issues
-    # it has with write fault injection and TXN
-    "track_and_verify_wals": 0,
-    "enable_remote_compaction": lambda: random.choice([0, 1]),
+    # TODO(hx235): enable `track_and_verify_wals` after stabalizing the stress test
+    "track_and_verify_wals": lambda: random.choice([0]),
+    "remote_compaction_worker_threads": lambda: random.choice([0, 8]),
+    "allow_resumption_one_in": lambda: random.choice([0, 1, 2, 20]),
+    # TODO(jaykorean): Change to lambda: random.choice([0, 1]) after addressing all remote compaction failures
+    "remote_compaction_failure_fall_back_to_local": 1,
     "auto_refresh_iterator_with_snapshot": lambda: random.choice([0, 1]),
+    "memtable_op_scan_flush_trigger": lambda: random.choice([0, 10, 100, 1000]),
+    "memtable_avg_op_scan_flush_trigger": lambda: random.choice([0, 2, 20, 200]),
+    "ingest_wbwi_one_in": lambda: random.choice([0, 0, 100, 500]),
+    "universal_reduce_file_locking": lambda: random.randint(0, 1),
+    "compression_manager": lambda: random.choice(
+        ["mixed"] * 1
+        + ["none"] * 2
+        + ["autoskip"] * 2
+        + ["randommixed"] * 2
+        + ["custom"] * 3
+    ),
+    # fixed within a run for easier debugging
+    # actual frequency is lower after option sanitization
+    "use_multiscan": random.choice([1] + [0] * 3),
+    # By default, `statistics` use kExceptDetailedTimers level
+    "statistics": random.choice([0, 1]),
+    "multiscan_use_async_io": random.randint(0, 1),
 }
+
 _TEST_DIR_ENV_VAR = "TEST_TMPDIR"
 # If TEST_TMPDIR_EXPECTED is not specified, default value will be TEST_TMPDIR
 _TEST_EXPECTED_DIR_ENV_VAR = "TEST_TMPDIR_EXPECTED"
@@ -468,6 +544,8 @@ whitebox_default_params = {
     #
     # Second, we need to make sure disabling WAL works with `-reopen > 0`.
     "disable_wal": 0,
+    # TODO: Re-enable this once we fix WAL + Remote Compaction in Stress Test
+    "remote_compaction_worker_threads": 0,
     "duration": 10000,
     "log2_keys_per_lock": 10,
     "ops_per_thread": 200000,
@@ -515,6 +593,7 @@ cf_consistency_params = {
     "ingest_external_file_one_in": 0,
     # `CfConsistencyStressTest::TestIterateAgainstExpected()` is not implemented.
     "verify_iterator_with_expected_state_one_in": 0,
+    "memtablerep": random.choice(["skip_list"] * 9 + ["vector"]),
 }
 
 # For pessimistic transaction db
@@ -522,11 +601,15 @@ txn_params = {
     "use_txn": 1,
     "use_optimistic_txn": 0,
     # Avoid lambda to set it once for the entire test
+    # NOTE: often passed in from command line overriding this
     "txn_write_policy": random.randint(0, 2),
     "unordered_write": random.randint(0, 1),
+    "use_per_key_point_lock_mgr": lambda: random.choice([0, 1]),
     # TODO: there is such a thing as transactions with WAL disabled. We should
     # cover that case.
     "disable_wal": 0,
+    # TODO: Re-enable this once we fix WAL + Remote Compaction in Stress Test
+    "remote_compaction_worker_threads": 0,
     # OpenReadOnly after checkpoint is not currnetly compatible with WritePrepared txns
     "checkpoint_one_in": 0,
     # pipeline write is not currnetly compatible with WritePrepared txns
@@ -584,6 +667,8 @@ blob_params = {
     "use_shared_block_and_blob_cache": lambda: random.randint(0, 1),
     "blob_cache_size": lambda: random.choice([1048576, 2097152, 4194304, 8388608]),
     "prepopulate_blob_cache": lambda: random.randint(0, 1),
+    # TODO Fix races when both Remote Compaction + BlobDB enabled
+    "remote_compaction_worker_threads": 0,
 }
 
 ts_params = {
@@ -600,6 +685,9 @@ ts_params = {
     "use_put_entity_one_in": 0,
     # TimedPut is not compatible with user-defined timestamps yet.
     "use_timed_put_one_in": 0,
+    # when test_best_efforts_recovery == true, disable_wal becomes 0.
+    # TODO: Re-enable this once we fix WAL + Remote Compaction in Stress Test
+    "remote_compaction_worker_threads": 0,
 }
 
 tiered_params = {
@@ -609,32 +697,40 @@ tiered_params = {
     "preclude_last_level_data_seconds": lambda: random.choice(
         [-1, -1, 10, 60, 1200, 86400]
     ),
-    "last_level_temperature": "kCold",
+    "last_level_temperature": lambda: random.choice(["kCold", "kIce"]),
     # For FIFO compaction (ignored otherwise)
     "file_temperature_age_thresholds": lambda: random.choice(
         [
+            "{{temperature=kWarm;age=10}:{temperature=kCool;age=30}:{temperature=kCold;age=100}:{temperature=kIce;age=300}}",
             "{{temperature=kWarm;age=30}:{temperature=kCold;age=300}}",
             "{{temperature=kCold;age=100}}",
         ]
     ),
+    "allow_trivial_copy_when_change_temperature": lambda: random.choice([0, 1]),
     # tiered storage doesn't support blob db yet
     "enable_blob_files": 0,
     "use_blob_db": 0,
     "default_write_temperature": lambda: random.choice(["kUnknown", "kHot", "kWarm"]),
 }
 
-multiops_txn_default_params = {
+multiops_txn_params = {
     "test_cf_consistency": 0,
     "test_batches_snapshots": 0,
     "test_multi_ops_txns": 1,
     "use_txn": 1,
+    # Avoid lambda to set it once for the entire test
+    # NOTE: often passed in from command line overriding this
+    "txn_write_policy": random.randint(0, 2),
     "two_write_queues": lambda: random.choice([0, 1]),
     # TODO: enable write-prepared
     "disable_wal": 0,
+    # TODO: Re-enable this once we fix WAL + Remote Compaction in Stress Test
+    "remote_compaction_worker_threads": 0,
     "use_only_the_last_commit_time_batch_for_recovery": lambda: random.choice([0, 1]),
     "clear_column_family_one_in": 0,
     "column_families": 1,
-    "enable_pipelined_write": lambda: random.choice([0, 1]),
+    # TODO re-enable pipelined write (lambda: random.choice([0, 1]))
+    "enable_pipelined_write": 0,
     # This test already acquires snapshots in reads
     "acquire_snapshot_one_in": 0,
     "backup_one_in": 0,
@@ -681,32 +777,7 @@ multiops_txn_default_params = {
     "use_timed_put_one_in": 0,
     # AttributeGroup not yet supported
     "use_attribute_group": 0,
-}
-
-multiops_wc_txn_params = {
-    "txn_write_policy": 0,
-    # TODO re-enable pipelined write. Not well tested atm
-    "enable_pipelined_write": 0,
     "commit_bypass_memtable_one_in": random.choice([0] * 4 + [100]),
-}
-
-multiops_wp_txn_params = {
-    "txn_write_policy": 1,
-    "wp_snapshot_cache_bits": 1,
-    # try small wp_commit_cache_bits, e.g. 0 once we explore storing full
-    # commit sequence numbers in commit cache
-    "wp_commit_cache_bits": 10,
-    # pipeline write is not currnetly compatible with WritePrepared txns
-    "enable_pipelined_write": 0,
-    # OpenReadOnly after checkpoint is not currnetly compatible with WritePrepared txns
-    "checkpoint_one_in": 0,
-    # Required to be 1 in order to use commit-time-batch
-    "use_only_the_last_commit_time_batch_for_recovery": 1,
-    "clear_wp_commit_cache_one_in": 10,
-    "create_timestamped_snapshot_one_in": 0,
-    # sequence number can be advanced in SwitchMemtable::WriteRecoverableState() for WP.
-    # disable it for now until we find another way to test LockWAL().
-    "lock_wal_one_in": 0,
 }
 
 
@@ -722,6 +793,7 @@ def finalize_and_sanitize(src_params):
     if dest_params["mmap_read"] == 1:
         dest_params["use_direct_io_for_flush_and_compaction"] = 0
         dest_params["use_direct_reads"] = 0
+        dest_params["multiscan_use_async_io"] = 0
     if (
         dest_params["use_direct_io_for_flush_and_compaction"] == 1
         or dest_params["use_direct_reads"] == 1
@@ -736,6 +808,14 @@ def finalize_and_sanitize(src_params):
         else:
             dest_params["mock_direct_io"] = True
 
+    if dest_params.get("memtablerep") == "vector":
+        dest_params["inplace_update_support"] = 0
+
+    # only skip list memtable representation supports paranoid memory checks
+    if dest_params.get("memtablerep") != "skip_list":
+        dest_params["paranoid_memory_checks"] = 0
+        dest_params["memtable_veirfy_per_key_checksum_on_seek"] = 0
+
     if dest_params["test_batches_snapshots"] == 1:
         dest_params["enable_compaction_filter"] = 0
         dest_params["inplace_update_support"] = 0
@@ -744,6 +824,7 @@ def finalize_and_sanitize(src_params):
         dest_params["metadata_write_fault_one_in"] = 0
         dest_params["read_fault_one_in"] = 0
         dest_params["metadata_read_fault_one_in"] = 0
+        dest_params["use_multiscan"] = 0
         if dest_params["prefix_size"] < 0:
             dest_params["prefix_size"] = 1
 
@@ -752,12 +833,42 @@ def finalize_and_sanitize(src_params):
     if dest_params.get("best_efforts_recovery") == 1:
         dest_params["inplace_update_support"] = 0
 
+    # Remote Compaction Incompatible Tests and Features
+    if dest_params.get("remote_compaction_worker_threads", 0) > 0:
+        # TODO Fix races when both Remote Compaction + BlobDB enabled
+        dest_params["enable_blob_files"] = 0
+        dest_params["enable_blob_garbage_collection"] = 0
+        dest_params["allow_setting_blob_options_dynamically"] = 0
+        # TODO Fix - Remote worker shouldn't recover from WAL
+        dest_params["disable_wal"] = 1
+        # Disable Incompatible Ones
+        dest_params["inplace_update_support"] = 0
+        dest_params["checkpoint_one_in"] = 0
+        dest_params["use_timed_put_one_in"] = 0
+        dest_params["test_secondary"] = 0
+        # Disable database open fault injection to prevent test inefficiency described below.
+        # When fault injection occurs during DB open, the db will wait for compaction
+        # to finish to clean up the database before retrying without injected error.
+        # However remote compaction threads are not yet created at that point
+        # so the db has to wait for the timeout (currently 30 seconds) to fall back to
+        # local compaction in order for the compaction to finish.
+        #
+        # TODO: Consider moving compaction thread creation earlier in the startup sequence
+        # to allow db open fault injection testing without this performance penalty
+        dest_params["open_metadata_write_fault_one_in"] = 0
+        dest_params["open_metadata_read_fault_one_in"] = 0
+        dest_params["open_write_fault_one_in"] = 0
+        dest_params["open_read_fault_one_in"] = 0
+        dest_params["sync_fault_injection"] = 0
+    else:
+        dest_params["allow_resumption_one_in"] = 0
+
     # Multi-key operations are not currently compatible with transactions or
     # timestamp.
     if (
         dest_params.get("test_batches_snapshots") == 1
         or dest_params.get("use_txn") == 1
-        or dest_params.get("user_timestamp_size") > 0
+        or dest_params.get("user_timestamp_size", 0) > 0
     ):
         dest_params["ingest_external_file_one_in"] = 0
     if (
@@ -785,7 +896,7 @@ def finalize_and_sanitize(src_params):
     if (
         dest_params.get("sync_fault_injection") == 1
         or dest_params.get("disable_wal") == 1
-        or dest_params.get("manual_wal_flush_one_in") > 0
+        or dest_params.get("manual_wal_flush_one_in", 0) > 0
     ):
         # File ingestion does not guarantee prefix-recoverability when unsynced
         # data can be lost. Ingesting a file syncs data immediately that is
@@ -802,8 +913,9 @@ def finalize_and_sanitize(src_params):
     # Remove the following once write-prepared/write-unprepared with/without
     # unordered write supports timestamped snapshots
     if dest_params.get("create_timestamped_snapshot_one_in", 0) > 0:
-        dest_params["txn_write_policy"] = 0
         dest_params["unordered_write"] = 0
+        if dest_params.get("txn_write_policy", 0) != 0:
+            dest_params["create_timestamped_snapshot_one_in"] = 0
     # Only under WritePrepared txns, unordered_write would provide the same guarnatees as vanilla rocksdb
     # unordered_write is only enabled with --txn, and txn_params disables inplace_update_support, so
     # setting allow_concurrent_memtable_write=1 won't conflcit with inplace_update_support.
@@ -882,12 +994,31 @@ def finalize_and_sanitize(src_params):
         dest_params["use_multi_cf_iterator"] = 0
         # only works with write committed policy
         dest_params["commit_bypass_memtable_one_in"] = 0
+        # not compatible with Remote Compaction yet
+        dest_params["remote_compaction_worker_threads"] = 0
     # TODO(hx235): enable test_multi_ops_txns with fault injection after stabilizing the CI
     if dest_params.get("test_multi_ops_txns") == 1:
         dest_params["write_fault_one_in"] = 0
         dest_params["metadata_write_fault_one_in"] = 0
         dest_params["read_fault_one_in"] = 0
         dest_params["metadata_read_fault_one_in"] = 0
+        if dest_params.get("txn_write_policy", 0) != 0:
+            # TODO: should any of this change for WUP (txn_write_policy==2)?
+            dest_params["wp_snapshot_cache_bits"] = 1
+            # try small wp_commit_cache_bits, e.g. 0 once we explore storing full
+            # commit sequence numbers in commit cache
+            dest_params["wp_commit_cache_bits"] = 10
+            # pipeline write is not currnetly compatible with WritePrepared txns
+            dest_params["enable_pipelined_write"] = 0
+            # OpenReadOnly after checkpoint is not currently compatible with WritePrepared txns
+            dest_params["checkpoint_one_in"] = 0
+            # Required to be 1 in order to use commit-time-batch
+            dest_params["use_only_the_last_commit_time_batch_for_recovery"] = 1
+            dest_params["clear_wp_commit_cache_one_in"] = 10
+            # sequence number can be advanced in SwitchMemtable::WriteRecoverableState() for WP.
+            # disable it for now until we find another way to test LockWAL().
+            dest_params["lock_wal_one_in"] = 0
+
     # Wide column stress tests require FullMergeV3
     if dest_params["use_put_entity_one_in"] != 0:
         dest_params["use_full_merge_v1"] = 0
@@ -945,8 +1076,6 @@ def finalize_and_sanitize(src_params):
         # disable atomic flush.
         if dest_params["test_best_efforts_recovery"] == 0:
             dest_params["disable_wal"] = 0
-    if dest_params.get("allow_concurrent_memtable_write", 1) == 1:
-        dest_params["memtablerep"] = "skip_list"
     if (
         dest_params.get("enable_compaction_filter", 0) == 1
         or dest_params.get("inplace_update_support", 0) == 1
@@ -965,28 +1094,68 @@ def finalize_and_sanitize(src_params):
         dest_params["check_multiget_consistency"] = 0
         dest_params["check_multiget_entity_consistency"] = 0
     if dest_params.get("disable_wal") == 0:
-        if dest_params.get("reopen") > 0 or (
-            dest_params.get("manual_wal_flush_one_in")
-            and dest_params.get("column_families") != 1
+        if (
+            dest_params.get("reopen", 0) > 0
+            or (
+                dest_params.get("manual_wal_flush_one_in")
+                and dest_params.get("column_families") != 1
+            )
+            or (
+                dest_params.get("use_txn") != 0
+                and dest_params.get("use_optimistic_txn") == 0
+            )
         ):
-            # Reopen with WAL currently requires persisting WAL data before closing for reopen.
+            # 1. Reopen with WAL currently requires persisting WAL data before closing for reopen.
             # Previous injected WAL write errors may not be cleared by the time of closing and ready
             # for persisting WAL.
             # To simplify, we disable any WAL write error injection.
             # TODO(hx235): support WAL write error injection with reopen
-            # TODO(hx235): support excluding WAL from metadata write fault injection so we don't
-            # have to disable metadata write fault injection to other file
             #
-            # WAL write failure can drop buffered WAL data. This can cause
+            # 2. WAL write failure can drop buffered WAL data. This can cause
             # inconsistency when one CF has a successful flush during auto
             # recovery. Disable the fault injection in this path for now until
             # we have a fix that allows auto recovery.
+            #
+            # 3. Pessimistic transactions use 2PC, which can't auto-recover from WAL write errors.
+            # This is because RocksDB cannot easily discard the corrupted WAL without risking the
+            # loss of uncommitted prepared data within the same WAL.
+            # Therefore disabling WAL write error injection in stress tests to prevent crashing
+            # since stress test does not support injecting errors that can' be auto-recovered.
+            #
+            # TODO(hx235): support excluding WAL from metadata write fault injection so we don't
+            # have to disable metadata write fault injection to other file
             dest_params["exclude_wal_from_write_fault_injection"] = 1
             dest_params["metadata_write_fault_one_in"] = 0
-    # Enabling block_align with compression is not supported
-    if dest_params.get("block_align") == 1:
-        dest_params["compression_type"] = "none"
-        dest_params["bottommost_compression_type"] = "none"
+
+            # TODO Fix - Remote worker shouldn't recover from WAL
+            dest_params["remote_compaction_worker_threads"] = 0
+    # Disabling block align if mixed manager is being used
+    if dest_params.get("compression_manager") == "custom":
+        if dest_params.get("block_align") == 1:
+            dest_params["block_align"] = 0
+        if dest_params["format_version"] < 7:
+            dest_params["format_version"] = 7
+    elif (
+        dest_params.get("compression_manager") == "mixed"
+        or dest_params.get("compression_manager") == "randommixed"
+    ):
+        dest_params["block_align"] = 0
+    elif dest_params.get("compression_manager") == "autoskip":
+        # ensuring the compression is being used
+        if dest_params.get("compression_type") == "none":
+            dest_params["compression_type"] = random.choice(
+                ["snappy", "zlib", "lz4", "lz4hc", "xpress", "zstd"]
+            )
+        if dest_params.get("bottommost_compression_type") == "none":
+            dest_params["bottommost_compression_type"] = random.choice(
+                ["snappy", "zlib", "lz4", "lz4hc", "xpress", "zstd"]
+            )
+        dest_params["block_align"] = 0
+    else:
+        # Enabling block_align with compression is not supported
+        if dest_params.get("block_align") == 1:
+            dest_params["compression_type"] = "none"
+            dest_params["bottommost_compression_type"] = "none"
     # If periodic_compaction_seconds is not set, daily_offpeak_time_utc doesn't do anything
     if dest_params.get("periodic_compaction_seconds") == 0:
         dest_params["daily_offpeak_time_utc"] = ""
@@ -995,7 +1164,7 @@ def finalize_and_sanitize(src_params):
     if dest_params.get("use_put_entity_one_in") == 1:
         dest_params["use_timed_put_one_in"] = 0
     elif (
-        dest_params.get("use_put_entity_one_in") > 1
+        dest_params.get("use_put_entity_one_in", 0) > 1
         and dest_params.get("use_timed_put_one_in") == 1
     ):
         dest_params["use_timed_put_one_in"] = 3
@@ -1020,16 +1189,45 @@ def finalize_and_sanitize(src_params):
     ):
         dest_params["enable_blob_files"] = 0
         dest_params["allow_setting_blob_options_dynamically"] = 0
-        dest_params["atomic_flush"] = 0
         dest_params["allow_concurrent_memtable_write"] = 0
         dest_params["use_put_entity_one_in"] = 0
         dest_params["use_get_entity"] = 0
         dest_params["use_multi_get_entity"] = 0
         dest_params["enable_pipelined_write"] = 0
         dest_params["use_attribute_group"] = 0
+    if (
+        dest_params.get("enable_pipelined_write", 0)
+        or dest_params.get("unordered_write", 0)
+        or dest_params.get("disable_wal", 0) == 0
+        or dest_params.get("user_timestamp_size", 0)
+    ):
+        dest_params["ingest_wbwi_one_in"] = 0
     # Continuous verification fails with secondaries inside NonBatchedOpsStressTest
     if dest_params.get("test_secondary") == 1:
         dest_params["continuous_verification_interval"] = 0
+    if dest_params.get("use_multiscan") == 1:
+        dest_params["async_io"] = 0
+        dest_params["delpercent"] += dest_params["delrangepercent"]
+        dest_params["delrangepercent"] = 0
+        dest_params["prefix_size"] = -1
+        dest_params["iterpercent"] += dest_params["prefixpercent"]
+        dest_params["prefixpercent"] = 0
+        dest_params["read_fault_one_in"] = 0
+        dest_params["memtable_prefix_bloom_size_ratio"] = 0
+        dest_params["max_sequential_skip_in_iterations"] = sys.maxsize
+        # This option ingests a delete range that might partially overlap with
+        # existing key range, which will cause a reseek that's currently not
+        # supported by multiscan
+        dest_params["test_ingest_standalone_range_deletion_one_in"] = 0
+        # LevelIterator multiscan currently relies on num_entries and num_range_deletions,
+        # which are not updated if skip_stats_update_on_db_open is true
+        dest_params["skip_stats_update_on_db_open"] = 0
+
+    # inplace update and key checksum verification during seek would cause race condition
+    # Therefore, when inplace_update_support is enabled, disable memtable_veirfy_per_key_checksum_on_seek
+    if dest_params["inplace_update_support"] == 1:
+        dest_params["memtable_veirfy_per_key_checksum_on_seek"] = 0
+
     return dest_params
 
 
@@ -1058,11 +1256,7 @@ def gen_cmd_params(args):
     if args.enable_ts:
         params.update(ts_params)
     if args.test_multiops_txn:
-        params.update(multiops_txn_default_params)
-        if args.write_policy == "write_committed":
-            params.update(multiops_wc_txn_params)
-        elif args.write_policy == "write_prepared":
-            params.update(multiops_wp_txn_params)
+        params.update(multiops_txn_params)
     if args.test_tiered_storage:
         params.update(tiered_params)
 
@@ -1111,7 +1305,6 @@ def gen_cmd(params, unknown_params):
                 "test_best_efforts_recovery",
                 "enable_ts",
                 "test_multiops_txn",
-                "write_policy",
                 "stress_cmd",
                 "test_tiered_storage",
                 "cleanup_cmd",
@@ -1186,6 +1379,7 @@ def blackbox_crash_main(args, unknown_args):
     )
 
     while time.time() < exit_time:
+        apply_random_seed_per_iteration()
         cmd = gen_cmd(
             dict(list(cmd_params.items()) + list({"db": dbname}.items())), unknown_args
         )
@@ -1248,6 +1442,7 @@ def whitebox_crash_main(args, unknown_args):
     succeeded = True
     hit_timeout = False
     while time.time() < exit_time:
+        apply_random_seed_per_iteration()
         if check_mode == 0:
             additional_opts = {
                 # use large ops per thread since we will kill it anyway
@@ -1422,7 +1617,6 @@ def main():
     parser.add_argument("--test_best_efforts_recovery", action="store_true")
     parser.add_argument("--enable_ts", action="store_true")
     parser.add_argument("--test_multiops_txn", action="store_true")
-    parser.add_argument("--write_policy", choices=["write_committed", "write_prepared"])
     parser.add_argument("--stress_cmd")
     parser.add_argument("--test_tiered_storage", action="store_true")
     parser.add_argument("--cleanup_cmd")
@@ -1438,9 +1632,7 @@ def main():
         + list(whitebox_simple_default_params.items())
         + list(blob_params.items())
         + list(ts_params.items())
-        + list(multiops_txn_default_params.items())
-        + list(multiops_wc_txn_params.items())
-        + list(multiops_wp_txn_params.items())
+        + list(multiops_txn_params.items())
         + list(best_efforts_recovery_params.items())
         + list(cf_consistency_params.items())
         + list(tiered_params.items())
@@ -1451,8 +1643,9 @@ def main():
     for k, v in all_params.items():
         parser.add_argument("--" + k, type=type(v() if callable(v) else v))
     # unknown_args are passed directly to db_stress
-    args, unknown_args = parser.parse_known_args()
 
+    global remain_args
+    args, unknown_args = parser.parse_known_args(remain_args)
     test_tmpdir = os.environ.get(_TEST_DIR_ENV_VAR)
     if test_tmpdir is not None and not args.skip_tmpdir_check:
         isdir = False
