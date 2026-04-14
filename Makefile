@@ -1233,14 +1233,14 @@ package:
 # 	Unit tests and tools
 # ---------------------------------------------------------------------------
 $(STATIC_LIBRARY): $(LIB_OBJECTS)
-	$(AM_V_AR)rm -f iphonesimulator-$@ $(SHARED1) $(SHARED2) $(SHARED3) $(SHARED4)
-	$(AM_V_at)$(AR) $(ARFLAGS) iphonesimulator-$@ $(addprefix ./iphonesimulator/, $(LIB_OBJECTS))
+	$(AM_V_AR)rm -f iphonesimulator/$@ $(SHARED1) $(SHARED2) $(SHARED3) $(SHARED4)
+	$(AM_V_at)$(AR) $(ARFLAGS) iphonesimulator/$@ $(addprefix ./iphonesimulator/, $(LIB_OBJECTS))
 
-	$(AM_V_AR)rm -f iphonedevice-$@ $(SHARED1) $(SHARED2) $(SHARED3) $(SHARED4)
-	$(AM_V_at)$(AR) $(ARFLAGS) iphonedevice-$@ $(addprefix ./iphonedevice/, $(LIB_OBJECTS))
+	$(AM_V_AR)rm -f iphonedevice/$@ $(SHARED1) $(SHARED2) $(SHARED3) $(SHARED4)
+	$(AM_V_at)$(AR) $(ARFLAGS) iphonedevice/$@ $(addprefix ./iphonedevice/, $(LIB_OBJECTS))
 
-	$(AM_V_AR)rm -f maccatalyst-$@ $(SHARED1) $(SHARED2) $(SHARED3) $(SHARED4)
-	$(AM_V_at)$(AR) $(ARFLAGS) maccatalyst-$@ $(addprefix maccatalyst/, $(LIB_OBJECTS))
+	$(AM_V_AR)rm -f maccatalyst/$@ $(SHARED1) $(SHARED2) $(SHARED3) $(SHARED4)
+	$(AM_V_at)$(AR) $(ARFLAGS) maccatalyst/$@ $(addprefix maccatalyst/, $(LIB_OBJECTS))
 
 $(STATIC_TEST_LIBRARY): $(TEST_OBJECTS)
 	$(AM_V_AR)rm -f $@ $(SHARED_TEST_LIBRARY)
@@ -2497,10 +2497,10 @@ endif
 
 xcframework:
 	xcodebuild -create-xcframework \
-	-library iphonedevice-librocksdb.a -headers $(INCLUDE_DIR) \
-	-library iphonesimulator-librocksdb.a -headers $(INCLUDE_DIR) \
-	-library maccatalyst-librocksdb.a -headers $(INCLUDE_DIR) \
-	-output RocksDB.xcframework
+		-library iphonedevice/librocksdb.a -headers $(INCLUDE_DIR) \
+		-library iphonesimulator/librocksdb.a -headers $(INCLUDE_DIR) \
+		-library maccatalyst/librocksdb.a -headers $(INCLUDE_DIR) \
+		-output RocksDB.xcframework
 
 else
 ifeq ($(HAVE_POWER8),1)

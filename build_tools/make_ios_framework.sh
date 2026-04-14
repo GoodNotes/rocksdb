@@ -20,6 +20,9 @@ fi
 rm iphonedevice-librocksdb.a || true
 rm iphonesimulator-librocksdb.a || true
 rm maccatalyst-librocksdb.a || true
+rm iphonedevice/librocksdb.a || true
+rm iphonesimulator/librocksdb.a || true
+rm maccatalyst/librocksdb.a || true
 make static_lib -j${CORES}
 
 # Create filtered include directory without Lua and C API headers
