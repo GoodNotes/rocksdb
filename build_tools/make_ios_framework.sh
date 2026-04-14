@@ -109,7 +109,7 @@ for slice in "${XCFRAMEWORK_NAME}"/*; do
     executable_path="${framework_dir}/${FRAMEWORK_EXECUTABLE_NAME}"
 
     rm -rf "${framework_dir}"
-    mkdir -p "${headers_dir}/rocksdb" "${modules_dir}"
+    mkdir -p "${headers_dir}" "${modules_dir}"
 
     mv "${slice}/librocksdb.a" "${executable_path}"
     if [[ -d "${slice}/Headers/rocksdb/rocksdb" ]]; then
