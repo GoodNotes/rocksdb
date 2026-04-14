@@ -69,6 +69,34 @@ write_framework_info_plist() {
 EOF
 }
 
+create_versioned_framework_layout() {
+    local framework_dir="$1"
+    local headers_dir="$2"
+    local modules_dir="$3"
+    local executable_path="$4"
+
+    local versions_dir="${framework_dir}/Versions"
+    local current_dir="${versions_dir}/A"
+    local resources_dir="${current_dir}/Resources"
+    local current_headers_dir="${current_dir}/Headers"
+    local current_modules_dir="${current_dir}/Modules"
+
+    mkdir -p "${current_headers_dir}" "${current_modules_dir}" "${resources_dir}"
+
+    mv "${headers_dir}/rocksdb" "${current_headers_dir}/rocksdb"
+    mv "${modules_dir}/module.modulemap" "${current_modules_dir}/module.modulemap"
+    mv "${executable_path}" "${current_dir}/${FRAMEWORK_EXECUTABLE_NAME}"
+
+    write_framework_info_plist "${resources_dir}"
+
+    rm -rf "${headers_dir}" "${modules_dir}"
+    ln -sf A "${versions_dir}/Current"
+    ln -sf "Versions/Current/Headers" "${framework_dir}/Headers"
+    ln -sf "Versions/Current/Modules" "${framework_dir}/Modules"
+    ln -sf "Versions/Current/Resources" "${framework_dir}/Resources"
+    ln -sf "Versions/Current/${FRAMEWORK_EXECUTABLE_NAME}" "${framework_dir}/${FRAMEWORK_EXECUTABLE_NAME}"
+}
+
 echo "Rewriting XCFramework slices as frameworks to avoid ProcessXCFramework collisions..."
 for slice in "${XCFRAMEWORK_NAME}"/*; do
     if [[ ! -d "${slice}" ]] || [[ "$(basename "${slice}")" == "Info.plist" ]]; then
@@ -78,11 +106,12 @@ for slice in "${XCFRAMEWORK_NAME}"/*; do
     framework_dir="${slice}/${FRAMEWORK_NAME}"
     headers_dir="${framework_dir}/Headers"
     modules_dir="${framework_dir}/Modules"
+    executable_path="${framework_dir}/${FRAMEWORK_EXECUTABLE_NAME}"
 
     rm -rf "${framework_dir}"
     mkdir -p "${headers_dir}/rocksdb" "${modules_dir}"
 
-    mv "${slice}/librocksdb.a" "${framework_dir}/${FRAMEWORK_EXECUTABLE_NAME}"
+    mv "${slice}/librocksdb.a" "${executable_path}"
     if [[ -d "${slice}/Headers/rocksdb/rocksdb" ]]; then
         mv "${slice}/Headers/rocksdb/rocksdb" "${headers_dir}/rocksdb"
     else
@@ -100,7 +129,11 @@ framework module ${FRAMEWORK_MODULE_NAME} {
 }
 EOF
 
-    write_framework_info_plist "${framework_dir}"
+    if [[ "$(basename "${slice}")" == *"maccatalyst"* ]]; then
+        create_versioned_framework_layout "${framework_dir}" "${headers_dir}" "${modules_dir}" "${executable_path}"
+    else
+        write_framework_info_plist "${framework_dir}"
+    fi
     rm -rf "${slice}/Headers"
 done
 
