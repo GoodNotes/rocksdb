@@ -10,25 +10,21 @@ FRAMEWORK_MODULE_NAME="RocksDB"
 export TARGET_OS=IOS
 export USE_RTTI=1
 
-LZ4_PREFIX=$(brew --prefix lz4)
-export CXXFLAGS="-DLZ4 -I${LZ4_PREFIX}/include"
-export LIBRARY_PATH="${LZ4_PREFIX}/lib:$LIBRARY_PATH"
-export CPLUS_INCLUDE_PATH="${LZ4_PREFIX}/include:$CPLUS_INCLUDE_PATH"
+LZ4_VENDOR_DIR="$(pwd)/third_party/lz4/lib"
+export CXXFLAGS="-DLZ4 -I${LZ4_VENDOR_DIR}"
+export CPLUS_INCLUDE_PATH="${LZ4_VENDOR_DIR}:${CPLUS_INCLUDE_PATH}"
 
 CORES=$(sysctl -n hw.ncpu)
 
-if ! brew list lz4 &>/dev/null; then
-    echo "LZ4 not installed. Installing via Homebrew..."
-    brew install lz4
+if [[ "${SKIP_STATIC_BUILD:-0}" != "1" ]]; then
+    rm iphonedevice-librocksdb.a || true
+    rm iphonesimulator-librocksdb.a || true
+    rm maccatalyst-librocksdb.a || true
+    rm iphonedevice/librocksdb.a || true
+    rm iphonesimulator/librocksdb.a || true
+    rm maccatalyst/librocksdb.a || true
+    make static_lib -j${CORES}
 fi
-
-rm iphonedevice-librocksdb.a || true
-rm iphonesimulator-librocksdb.a || true
-rm maccatalyst-librocksdb.a || true
-rm iphonedevice/librocksdb.a || true
-rm iphonesimulator/librocksdb.a || true
-rm maccatalyst/librocksdb.a || true
-make static_lib -j${CORES}
 
 # Create filtered include directory without Lua and C API headers
 echo "Creating filtered include directory (excluding Lua and C API)..."
@@ -39,6 +35,74 @@ cp include/module.modulemap include_filtered/
 
 rm -rf "${XCFRAMEWORK_NAME}" || true
 make xcframework FILTERED_INCLUDES=1
+
+build_lz4_static_lib() {
+    local triple="$1"
+    local sdk_path="$2"
+    local output_archive="$3"
+    local object_dir="${output_archive%.a}.objs"
+
+    rm -rf "${object_dir}"
+    mkdir -p "${object_dir}"
+
+    for source_name in lz4.c lz4hc.c lz4frame.c xxhash.c; do
+        clang -c "${LZ4_VENDOR_DIR}/${source_name}" \
+            -O2 \
+            -fPIC \
+            -target "${triple}" \
+            -isysroot "${sdk_path}" \
+            -I"${LZ4_VENDOR_DIR}" \
+            -o "${object_dir}/${source_name%.c}.o"
+    done
+
+    libtool -static -o "${output_archive}" "${object_dir}"/*.o
+}
+
+build_framework_binary() {
+    local slice_dir="$1"
+    local output_path="$2"
+    local sdk_path="$3"
+    shift 3
+    local triples=("$@")
+    local slice_name
+    local rocksdb_archive="${slice_dir}/librocksdb.a"
+    local build_dir="${slice_dir}/.framework-build"
+    local dylibs=()
+
+    rm -rf "${build_dir}"
+    mkdir -p "${build_dir}"
+
+    for triple in "${triples[@]}"; do
+        local arch="${triple%%-*}"
+        local arch_rocksdb_archive="${build_dir}/librocksdb-${arch}.a"
+        local arch_lz4_archive="${build_dir}/liblz4-${arch}.a"
+        local arch_dylib="${build_dir}/RocksDB-${arch}.dylib"
+
+        if lipo -info "${rocksdb_archive}" | grep -q "Non-fat file"; then
+            cp "${rocksdb_archive}" "${arch_rocksdb_archive}"
+        else
+            lipo -extract "${arch}" "${rocksdb_archive}" -output "${arch_rocksdb_archive}"
+        fi
+        build_lz4_static_lib "${triple}" "${sdk_path}" "${arch_lz4_archive}"
+
+        clang++ -dynamiclib \
+            -target "${triple}" \
+            -isysroot "${sdk_path}" \
+            -install_name "@rpath/${FRAMEWORK_NAME}/${FRAMEWORK_EXECUTABLE_NAME}" \
+            -Wl,-all_load,"${arch_rocksdb_archive}" \
+            "${arch_lz4_archive}" \
+            -lc++ \
+            -o "${arch_dylib}"
+
+        dylibs+=("${arch_dylib}")
+    done
+
+    if [[ ${#dylibs[@]} -eq 1 ]]; then
+        cp "${dylibs[0]}" "${output_path}"
+    else
+        lipo -create "${dylibs[@]}" -output "${output_path}"
+    fi
+}
 
 write_framework_info_plist() {
     local framework_dir="$1"
@@ -120,19 +184,25 @@ for slice in "${XCFRAMEWORK_NAME}"/*; do
     case "$(basename "${slice}")" in
         *maccatalyst*)
             sdk_name="macosx$(xcrun --sdk macosx --show-sdk-version)"
+            sdk_path="$(xcrun --sdk macosx --show-sdk-path)"
+            triples=("arm64-apple-ios15.0-macabi" "x86_64-apple-ios15.0-macabi")
             ;;
         *simulator*)
             sdk_name="iphonesimulator$(xcrun --sdk iphonesimulator --show-sdk-version)"
+            sdk_path="$(xcrun --sdk iphonesimulator --show-sdk-path)"
+            triples=("arm64-apple-ios15.0-simulator" "x86_64-apple-ios15.0-simulator")
             ;;
         *)
             sdk_name="iphoneos$(xcrun --sdk iphoneos --show-sdk-version)"
+            sdk_path="$(xcrun --sdk iphoneos --show-sdk-path)"
+            triples=("arm64-apple-ios15.0")
             ;;
     esac
 
     rm -rf "${framework_dir}"
     mkdir -p "${headers_dir}" "${modules_dir}"
 
-    mv "${slice}/librocksdb.a" "${executable_path}"
+    build_framework_binary "${slice}" "${executable_path}" "${sdk_path}" "${triples[@]}"
     if [[ -d "${slice}/Headers/rocksdb/rocksdb" ]]; then
         mv "${slice}/Headers/rocksdb/rocksdb" "${headers_dir}/rocksdb"
     else
@@ -155,7 +225,7 @@ EOF
     else
         write_framework_info_plist "${framework_dir}" "${minimum_os_version}" "${sdk_name}"
     fi
-    rm -rf "${slice}/Headers"
+    rm -rf "${slice}/Headers" "${slice}/librocksdb.a" "${slice}/.framework-build"
 done
 
 for index in 0 1 2; do
