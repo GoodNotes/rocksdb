@@ -42,6 +42,8 @@ make xcframework FILTERED_INCLUDES=1
 
 write_framework_info_plist() {
     local framework_dir="$1"
+    local minimum_os_version="$2"
+    local sdk_name="$3"
 
     cat > "${framework_dir}/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -64,6 +66,10 @@ write_framework_info_plist() {
     <string>1.0</string>
     <key>CFBundleVersion</key>
     <string>1</string>
+    <key>DTSDKName</key>
+    <string>${sdk_name}</string>
+    <key>MinimumOSVersion</key>
+    <string>${minimum_os_version}</string>
 </dict>
 </plist>
 EOF
@@ -80,6 +86,8 @@ create_versioned_framework_layout() {
     local resources_dir="${current_dir}/Resources"
     local current_headers_dir="${current_dir}/Headers"
     local current_modules_dir="${current_dir}/Modules"
+    local minimum_os_version="$5"
+    local sdk_name="$6"
 
     mkdir -p "${current_headers_dir}" "${current_modules_dir}" "${resources_dir}"
 
@@ -87,7 +95,7 @@ create_versioned_framework_layout() {
     mv "${modules_dir}/module.modulemap" "${current_modules_dir}/module.modulemap"
     mv "${executable_path}" "${current_dir}/${FRAMEWORK_EXECUTABLE_NAME}"
 
-    write_framework_info_plist "${resources_dir}"
+    write_framework_info_plist "${resources_dir}" "${minimum_os_version}" "${sdk_name}"
 
     rm -rf "${headers_dir}" "${modules_dir}"
     ln -sf A "${versions_dir}/Current"
@@ -107,6 +115,19 @@ for slice in "${XCFRAMEWORK_NAME}"/*; do
     headers_dir="${framework_dir}/Headers"
     modules_dir="${framework_dir}/Modules"
     executable_path="${framework_dir}/${FRAMEWORK_EXECUTABLE_NAME}"
+    minimum_os_version="15.0"
+
+    case "$(basename "${slice}")" in
+        *maccatalyst*)
+            sdk_name="macosx$(xcrun --sdk macosx --show-sdk-version)"
+            ;;
+        *simulator*)
+            sdk_name="iphonesimulator$(xcrun --sdk iphonesimulator --show-sdk-version)"
+            ;;
+        *)
+            sdk_name="iphoneos$(xcrun --sdk iphoneos --show-sdk-version)"
+            ;;
+    esac
 
     rm -rf "${framework_dir}"
     mkdir -p "${headers_dir}" "${modules_dir}"
@@ -130,9 +151,9 @@ framework module ${FRAMEWORK_MODULE_NAME} {
 EOF
 
     if [[ "$(basename "${slice}")" == *"maccatalyst"* ]]; then
-        create_versioned_framework_layout "${framework_dir}" "${headers_dir}" "${modules_dir}" "${executable_path}"
+        create_versioned_framework_layout "${framework_dir}" "${headers_dir}" "${modules_dir}" "${executable_path}" "${minimum_os_version}" "${sdk_name}"
     else
-        write_framework_info_plist "${framework_dir}"
+        write_framework_info_plist "${framework_dir}" "${minimum_os_version}" "${sdk_name}"
     fi
     rm -rf "${slice}/Headers"
 done
