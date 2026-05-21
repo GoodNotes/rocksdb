@@ -168,6 +168,15 @@ Status ReadSet::ReadIndex(size_t block_index, CachableEntry<Block>* out) {
   // SubmitJob)
   if (pinned_blocks_[block_index].GetValue()) {
     *out = std::move(pinned_blocks_[block_index]);
+    // Release memory accounting for prefetched blocks. After moving the value
+    // out, ReleaseBlock() and the destructor check pinned_blocks_.GetValue()
+    // which will be null, so they won't release memory again.
+    if (block_index < block_sizes_.size() && block_sizes_[block_index] > 0) {
+      if (auto dispatcher_data = dispatcher_data_.lock()) {
+        dispatcher_data->ReleaseMemory(block_sizes_[block_index]);
+      }
+      block_sizes_[block_index] = 0;
+    }
     // Note: Statistics for this block were already counted during SubmitJob
     // (either as cache hit or sync read)
     return Status::OK();
@@ -190,6 +199,14 @@ Status ReadSet::ReadIndex(size_t block_index, CachableEntry<Block>* out) {
       // After polling, the block should be in pinned_blocks_
       if (pinned_blocks_[block_index].GetValue()) {
         *out = std::move(pinned_blocks_[block_index]);
+        // Release memory accounting (same as case 1 above)
+        if (block_index < block_sizes_.size() &&
+            block_sizes_[block_index] > 0) {
+          if (auto dispatcher_data = dispatcher_data_.lock()) {
+            dispatcher_data->ReleaseMemory(block_sizes_[block_index]);
+          }
+          block_sizes_[block_index] = 0;
+        }
         return Status::OK();
       }
 
@@ -197,8 +214,12 @@ Status ReadSet::ReadIndex(size_t block_index, CachableEntry<Block>* out) {
     }
   }
 
-  // Case 3: Block needs synchronous read
-  // If this block was pending prefetch, remove it since we're reading it now
+  // Case 3: Block needs synchronous read (pending or never-dispatched blocks).
+  // No ReleaseMemory() needed here because blocks reaching this path never had
+  // TryAcquireMemory() called — they were either pending prefetch or skipped
+  // during SubmitJob. block_sizes_[block_index] may be > 0 (set during
+  // SubmitJob for all uncached blocks) but that does not imply memory was
+  // acquired.
   RemoveFromPending(block_index);
 
   Status s = SyncRead(block_index);
@@ -336,9 +357,24 @@ Status ReadSet::SyncRead(size_t block_index) {
   const auto& block_handle = job_->block_handles[block_index];
   auto* rep = job_->table->get_rep();
 
+  // Get dictionary-aware decompressor if available
+  UnownedPtr<Decompressor> decompressor = rep->decompressor.get();
+  CachableEntry<DecompressorDict> cached_dict;
+  if (rep->uncompression_dict_reader) {
+    Status s = rep->uncompression_dict_reader->GetOrReadUncompressionDictionary(
+        nullptr, job_->job_options.read_options, nullptr, nullptr,
+        &cached_dict);
+    if (!s.ok()) {
+      return s;
+    }
+    if (cached_dict.GetValue()) {
+      decompressor = cached_dict.GetValue()->decompressor_.get();
+    }
+  }
+
   return job_->table->RetrieveBlock<Block_kData>(
       /*prefetch_buffer=*/nullptr, job_->job_options.read_options, block_handle,
-      rep->decompressor.get(), &pinned_blocks_[block_index].As<Block_kData>(),
+      decompressor, &pinned_blocks_[block_index].As<Block_kData>(),
       /*get_context=*/nullptr, /*lookup_context=*/nullptr,
       /*for_compaction=*/false, /*use_cache=*/true,
       /*async_read=*/false, /*use_block_cache_for_lookup=*/true);

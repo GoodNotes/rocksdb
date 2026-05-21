@@ -1759,9 +1759,13 @@ rocksdb_column_family_handle_t* rocksdb_create_column_family(
     rocksdb_t* db, const rocksdb_options_t* column_family_options,
     const char* column_family_name, char** errptr) {
   rocksdb_column_family_handle_t* handle = new rocksdb_column_family_handle_t;
-  SaveError(errptr, db->rep->CreateColumnFamily(
-                        ColumnFamilyOptions(column_family_options->rep),
-                        std::string(column_family_name), &(handle->rep)));
+  handle->rep = nullptr;
+  if (SaveError(errptr, db->rep->CreateColumnFamily(
+                            ColumnFamilyOptions(column_family_options->rep),
+                            std::string(column_family_name), &(handle->rep)))) {
+    delete handle;
+    return nullptr;
+  }
   handle->immortal = false;
   return handle;
 }
@@ -4351,6 +4355,15 @@ unsigned char rocksdb_options_get_paranoid_checks(rocksdb_options_t* opt) {
   return opt->rep.paranoid_checks;
 }
 
+void rocksdb_options_set_open_files_async(rocksdb_options_t* opt,
+                                          unsigned char v) {
+  opt->rep.open_files_async = v;
+}
+
+unsigned char rocksdb_options_get_open_files_async(rocksdb_options_t* opt) {
+  return opt->rep.open_files_async;
+}
+
 void rocksdb_options_set_db_paths(rocksdb_options_t* opt,
                                   const rocksdb_dbpath_t** dbpath_values,
                                   size_t num_paths) {
@@ -5789,6 +5802,16 @@ uint64_t rocksdb_perfcontext_metric(rocksdb_perfcontext_t* context,
       return rep->internal_range_del_reseek_count;
     case rocksdb_block_read_cpu_time:
       return rep->block_read_cpu_time;
+    case rocksdb_data_block_read_byte:
+      return rep->data_block_read_byte;
+    case rocksdb_index_block_read_byte:
+      return rep->index_block_read_byte;
+    case rocksdb_filter_block_read_byte:
+      return rep->filter_block_read_byte;
+    case rocksdb_compression_dict_block_read_byte:
+      return rep->compression_dict_block_read_byte;
+    case rocksdb_metadata_block_read_byte:
+      return rep->metadata_block_read_byte;
     default:
       break;
   }
@@ -7525,9 +7548,13 @@ rocksdb_column_family_handle_t* rocksdb_transactiondb_create_column_family(
     const rocksdb_options_t* column_family_options,
     const char* column_family_name, char** errptr) {
   rocksdb_column_family_handle_t* handle = new rocksdb_column_family_handle_t;
-  SaveError(errptr, txn_db->rep->CreateColumnFamily(
-                        ColumnFamilyOptions(column_family_options->rep),
-                        std::string(column_family_name), &(handle->rep)));
+  handle->rep = nullptr;
+  if (SaveError(errptr, txn_db->rep->CreateColumnFamily(
+                            ColumnFamilyOptions(column_family_options->rep),
+                            std::string(column_family_name), &(handle->rep)))) {
+    delete handle;
+    return nullptr;
+  }
   handle->immortal = false;
   return handle;
 }

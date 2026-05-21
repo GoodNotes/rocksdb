@@ -133,11 +133,22 @@ with open('${sorted_input_data}', 'w') as f:
     print(k + " ==> " + v, file=f)
 EOF
 
+# Generate a file with uniformly distributed keys
+uniform_input_data=$input_data_path/uniform_data
+echo == Generating file with uniform keys ${uniform_input_data}
+$python_bin - <<EOF
+with open('${uniform_input_data}', 'w') as f:
+  for i in range(0, 2000):
+    k = f"{i:012d}"
+    v = f"value{i:012d}"
+    print(k + " ==> " + v, file=f)
+EOF
+
 # db_backward_only_refs defined below the rest
 
 # To check for DB forward compatibility with loading options (old version
 # reading data from new), as well as backward compatibility
-declare -a db_forward_with_options_refs=("10.4.fb" "10.5.fb" "10.6.fb" "10.7.fb" "10.8.fb" "10.9.fb" "10.10.fb" "10.11.fb")
+declare -a db_forward_with_options_refs=("10.4.fb" "10.5.fb" "10.6.fb" "10.7.fb" "10.8.fb" "10.9.fb" "10.10.fb" "10.11.fb" "11.0.fb")
 # To check for DB forward compatibility without loading options (in addition
 # to the "with loading options" set), as well as backward compatibility
 declare -a db_forward_no_options_refs=() # N/A at the moment

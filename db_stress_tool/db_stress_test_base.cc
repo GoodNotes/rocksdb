@@ -29,6 +29,7 @@
 #include "options/options_parser.h"
 #include "rocksdb/convenience.h"
 #include "rocksdb/filter_policy.h"
+#include "rocksdb/io_dispatcher.h"
 #include "rocksdb/secondary_cache.h"
 #include "rocksdb/sst_file_manager.h"
 #include "rocksdb/table_properties.h"
@@ -41,6 +42,7 @@
 #include "utilities/backup/backup_engine_impl.h"
 #include "utilities/fault_injection_fs.h"
 #include "utilities/fault_injection_secondary_cache.h"
+#include "utilities/trie_index/trie_index_factory.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -929,6 +931,22 @@ Status StressTest::CommitTxn(Transaction& txn, ThreadState* thread) {
   return s;
 }
 
+bool StressTest::IsExpectedTxnError(const Status& s) {
+  if ((s.IsDeadlock() || s.IsTimedOut()) &&
+      (FLAGS_use_multiget || FLAGS_use_multi_get_entity)) {
+    return true;
+  }
+  // Optimistic transaction may return TryAgain when memtable history is
+  // insufficient for conflict detection (controlled by
+  // max_write_buffer_size_to_maintain). ExecuteTransaction retries up to 10
+  // times, and if all retries fail, it returns TryAgain. This is an expected
+  // condition and should not crash the stress test.
+  if (s.IsTryAgain() && FLAGS_use_optimistic_txn) {
+    return true;
+  }
+  return false;
+}
+
 Status StressTest::ExecuteTransaction(WriteOptions& write_opts,
                                       ThreadState* thread,
                                       std::function<Status(Transaction&)>&& ops,
@@ -985,6 +1003,9 @@ void StressTest::OperateDb(ThreadState* thread) {
   read_opts.allow_unprepared_value = FLAGS_allow_unprepared_value;
   read_opts.auto_refresh_iterator_with_snapshot =
       FLAGS_auto_refresh_iterator_with_snapshot;
+  if (FLAGS_use_trie_index && udi_factory_) {
+    read_opts.table_index_factory = udi_factory_.get();
+  }
 
   WriteOptions write_opts;
   if (FLAGS_rate_limit_auto_wal_flush) {
@@ -1034,6 +1055,9 @@ void StressTest::OperateDb(ThreadState* thread) {
       }
       // Commenting this out as we don't want to reset stats on each open.
       // thread->stats.Start();
+      if (FLAGS_use_trie_index && udi_factory_) {
+        read_opts.table_index_factory = udi_factory_.get();
+      }
     }
 
 #ifndef NDEBUG
@@ -1692,6 +1716,14 @@ Status StressTest::TestMultiScan(ThreadState* thread,
       FLAGS_multiscan_use_async_io &&
       CheckFSFeatureSupport(options_.env->GetFileSystem().get(),
                             FSSupportedOps::kAsyncIO);
+  std::shared_ptr<IODispatcher> io_dispatcher;
+  if (FLAGS_multiscan_max_prefetch_memory_bytes > 0) {
+    IODispatcherOptions io_opts;
+    io_opts.max_prefetch_memory_bytes =
+        FLAGS_multiscan_max_prefetch_memory_bytes;
+    io_dispatcher.reset(NewIODispatcher(io_opts));
+    scan_opts.io_dispatcher = io_dispatcher;
+  }
   start_key_strs.reserve(num_scans);
   end_key_strs.reserve(num_scans);
 
@@ -1976,7 +2008,19 @@ Status StressTest::TestIterateImpl(ThreadState* thread,
 
     Slice key(key_str);
 
-    const bool support_seek_first_or_last = expect_total_order;
+    // UserDefinedIndexIterator supports Seek(target), Next(), and
+    // SeekToFirst(). However, SeekToLast, SeekForPrev, and Prev are not
+    // supported. Check if UDI is being used either via ReadOptions or
+    // CF-level configuration.
+    const bool using_udi =
+        (ro.table_index_factory != nullptr) || (udi_factory_ != nullptr);
+    // SeekToFirst is supported by UDI, so only total_order is required.
+    const bool support_seek_to_first =
+        expect_total_order && (FLAGS_test_backward_scan || using_udi);
+    // SeekToLast requires backward scan support which UDI does not provide.
+    const bool support_seek_to_last =
+        expect_total_order && FLAGS_test_backward_scan && !using_udi;
+    const bool support_seek_for_prev = FLAGS_test_backward_scan && !using_udi;
 
     // Write-prepared and Write-unprepared and multi-cf-iterator do not support
     // Refresh() yet.
@@ -1991,17 +2035,17 @@ Status StressTest::TestIterateImpl(ThreadState* thread,
     }
 
     LastIterateOp last_op;
-    if (support_seek_first_or_last && thread->rand.OneIn(100)) {
+    if (support_seek_to_first && thread->rand.OneIn(100)) {
       iter->SeekToFirst();
       cmp_iter->SeekToFirst();
       last_op = kLastOpSeekToFirst;
       op_logs += "STF ";
-    } else if (support_seek_first_or_last && thread->rand.OneIn(100)) {
+    } else if (support_seek_to_last && thread->rand.OneIn(100)) {
       iter->SeekToLast();
       cmp_iter->SeekToLast();
       last_op = kLastOpSeekToLast;
       op_logs += "STL ";
-    } else if (thread->rand.OneIn(8)) {
+    } else if (support_seek_for_prev && thread->rand.OneIn(8)) {
       iter->SeekForPrev(key);
       cmp_iter->SeekForPrev(key);
       last_op = kLastOpSeekForPrev;
@@ -2033,7 +2077,8 @@ Status StressTest::TestIterateImpl(ThreadState* thread,
                    key, op_logs, verify_func, &diverged);
 
     const bool no_reverse =
-        (FLAGS_memtablerep == "prefix_hash" && !expect_total_order);
+        (FLAGS_memtablerep == "prefix_hash" && !expect_total_order) ||
+        !FLAGS_test_backward_scan;
     for (uint64_t i = 0; i < FLAGS_num_iterations && iter->Valid(); ++i) {
       if (no_reverse || thread->rand.OneIn(2)) {
         iter->Next();
@@ -3630,8 +3675,11 @@ void StressTest::Open(SharedState* shared, bool reopen) {
   assert(db_ == nullptr);
   assert(txn_db_ == nullptr);
   assert(optimistic_txn_db_ == nullptr);
+  if (FLAGS_use_trie_index) {
+    udi_factory_ = std::make_shared<trie_index::TrieIndexFactory>();
+  }
   if (!InitializeOptionsFromFile(options_)) {
-    InitializeOptionsFromFlags(cache_, filter_policy_, options_);
+    InitializeOptionsFromFlags(cache_, filter_policy_, udi_factory_, options_);
   }
   InitializeOptionsGeneral(cache_, filter_policy_, sqfc_factory_, options_);
   DbStressCustomCompressionManager::Register();
@@ -3669,13 +3717,6 @@ void StressTest::Open(SharedState* shared, bool reopen) {
 
   // Remote Compaction
   if (FLAGS_remote_compaction_worker_threads > 0) {
-    // TODO(jaykorean) Remove this after fix - remote worker shouldn't recover
-    // from WAL
-    if (!FLAGS_disable_wal) {
-      fprintf(stderr,
-              "WAL is not compatible with Remote Compaction in Stress Test\n");
-      exit(1);
-    }
     if ((options_.enable_blob_files ||
          options_.enable_blob_garbage_collection ||
          FLAGS_allow_setting_blob_options_dynamically)) {
@@ -4271,6 +4312,7 @@ bool InitializeOptionsFromFile(Options& options) {
 void InitializeOptionsFromFlags(
     const std::shared_ptr<Cache>& cache,
     const std::shared_ptr<const FilterPolicy>& filter_policy,
+    const std::shared_ptr<UserDefinedIndexFactory>& udi_factory,
     Options& options) {
   BlockBasedTableOptions block_based_options;
   block_based_options.decouple_partitioned_filters =
@@ -4331,6 +4373,7 @@ void InitializeOptionsFromFlags(
   block_based_options.index_block_search_type =
       static_cast<BlockBasedTableOptions::BlockSearchType>(
           FLAGS_index_block_search_type);
+  block_based_options.uniform_cv_threshold = FLAGS_uniform_cv_threshold;
   block_based_options.prepopulate_block_cache =
       static_cast<BlockBasedTableOptions::PrepopulateBlockCache>(
           FLAGS_prepopulate_block_cache);
@@ -4353,6 +4396,9 @@ void InitializeOptionsFromFlags(
       fLU64::FLAGS_super_block_alignment_size;
   block_based_options.super_block_alignment_space_overhead_ratio =
       fLU64::FLAGS_super_block_alignment_space_overhead_ratio;
+  if (udi_factory) {
+    block_based_options.user_defined_index_factory = udi_factory;
+  }
   options.table_factory.reset(NewBlockBasedTableFactory(block_based_options));
   options.db_write_buffer_size = FLAGS_db_write_buffer_size;
   options.write_buffer_size = FLAGS_write_buffer_size;
@@ -4399,6 +4445,13 @@ void InitializeOptionsFromFlags(
     }
   }
   options.max_open_files = FLAGS_open_files;
+  options.open_files_async = FLAGS_open_files_async;
+  if (FLAGS_open_files_async && !FLAGS_skip_stats_update_on_db_open) {
+    FLAGS_skip_stats_update_on_db_open = true;
+    fprintf(stderr,
+            "open_files_async requires skip_stats_update_on_db_open, "
+            "enabling it automatically\n");
+  }
   if (FLAGS_statistics) {
     options.statistics = ROCKSDB_NAMESPACE::CreateDBStatistics();
   }
@@ -4444,6 +4497,8 @@ void InitializeOptionsFromFlags(
   }
   options.max_manifest_file_size = FLAGS_max_manifest_file_size;
   options.max_manifest_space_amp_pct = FLAGS_max_manifest_space_amp_pct;
+  options.verify_manifest_content_on_close =
+      FLAGS_verify_manifest_content_on_close;
   options.max_subcompactions = static_cast<uint32_t>(FLAGS_subcompactions);
   options.allow_concurrent_memtable_write =
       FLAGS_allow_concurrent_memtable_write;
@@ -4472,6 +4527,8 @@ void InitializeOptionsFromFlags(
   options.write_dbid_to_manifest = FLAGS_write_dbid_to_manifest;
   options.write_identity_file = FLAGS_write_identity_file;
   options.avoid_flush_during_recovery = FLAGS_avoid_flush_during_recovery;
+  options.enforce_write_buffer_manager_during_recovery =
+      FLAGS_enforce_write_buffer_manager_during_recovery;
   options.max_write_batch_group_size_bytes =
       FLAGS_max_write_batch_group_size_bytes;
   options.level_compaction_dynamic_level_bytes =
@@ -4483,9 +4540,13 @@ void InitializeOptionsFromFlags(
   options.memtable_protection_bytes_per_key =
       FLAGS_memtable_protection_bytes_per_key;
   options.block_protection_bytes_per_key = FLAGS_block_protection_bytes_per_key;
+  options.verify_output_flags =
+      static_cast<VerifyOutputFlags>(FLAGS_verify_output_flags);
   options.paranoid_memory_checks = FLAGS_paranoid_memory_checks;
   options.memtable_veirfy_per_key_checksum_on_seek =
       FLAGS_memtable_veirfy_per_key_checksum_on_seek;
+  options.memtable_batch_lookup_optimization =
+      FLAGS_memtable_batch_lookup_optimization;
 
   // Integrated BlobDB
   options.enable_blob_files = FLAGS_enable_blob_files;
@@ -4714,10 +4775,18 @@ void InitializeOptionsGeneral(
               "`preserve_unverified_changes` to keep all files\n");
       options.avoid_flush_during_recovery = true;
     }
-    // Together with `avoid_flush_during_recovery == true`, this will prevent
-    // live files from becoming obsolete and deleted between `DB::Open()` and
-    // `DisableFileDeletions()` due to flush or compaction. We do not need to
-    // warn the user since we will reenable compaction soon.
+    if (options.enforce_write_buffer_manager_during_recovery) {
+      fprintf(
+          stderr,
+          "WARNING: flipping `enforce_write_buffer_manager_during_recovery` "
+          "to false for `preserve_unverified_changes` to keep all files\n");
+      options.enforce_write_buffer_manager_during_recovery = false;
+    }
+    // Together with `avoid_flush_during_recovery == true` and
+    // `enforce_write_buffer_manager_during_recovery == false`, this will
+    // prevent live files from becoming obsolete and deleted between
+    // `DB::Open()` and `DisableFileDeletions()` due to flush or compaction.
+    // We do not need to warn the user since we will reenable compaction soon.
     options.disable_auto_compactions = true;
   }
 
